@@ -1,5 +1,5 @@
 from collections.abc import Sequence
-from datetime import timedelta
+from datetime import date, timedelta
 from typing import TYPE_CHECKING, Any
 
 from app.models.activity import AgentRole
@@ -56,6 +56,8 @@ METADATA_CONTEXT = {
     "dqv": "http://www.w3.org/ns/dqv#",
     "foaf": "http://xmlns.com/foaf/0.1/",
     "oa": "http://www.w3.org/ns/oa#",
+    "adms": "http://www.w3.org/ns/adms#",
+    "skos": "http://www.w3.org/2004/02/skos/core#",
     "title": "dct:title",
     "description": "dct:description",
     "publisher": "dct:publisher",
@@ -132,10 +134,33 @@ def _agent_node(
         "dct:title": source.name,
         "dct:description": source.description,
     }
+    if source.persistent_identifier:
+        node["adms:identifier"] = _persistent_identifier_node(
+            source.persistent_identifier
+        )
     if version:
         node["dcat:version"] = version
     if acted_on_behalf_of:
         node["prov:actedOnBehalfOf"] = [{"@id": uri} for uri in acted_on_behalf_of]
+    return {k: v for k, v in node.items() if v is not None}
+
+
+def _instrument_node(source: "Source", base_url: str) -> dict[str, Any]:
+    """An instrument Source as the ``prov:Entity`` an activity uses.
+
+    It measures but does not act, so it is not an agent.
+    """
+    names = Identifiers(base_url)
+    node: dict[str, Any] = {
+        "@id": names.source(source.id),
+        "@type": "prov:Entity",
+        "dct:title": source.name,
+        "dct:description": source.description,
+    }
+    if source.persistent_identifier:
+        node["adms:identifier"] = _persistent_identifier_node(
+            source.persistent_identifier
+        )
     return {k: v for k, v in node.items() if v is not None}
 
 
@@ -263,6 +288,40 @@ def _as_uri(identifier: str) -> str | None:
     if candidate.startswith("10."):
         return f"https://doi.org/{candidate}"
     return None
+
+
+def _persistent_identifier_node(identifier: str) -> dict[str, Any]:
+    """A registered persistent identifier as an ``adms:Identifier``.
+
+    ``dct:identifier`` stays the record's FDS identifier, as DCAT-AP has it. The
+    value is a full URI where its scheme has a canonical resolver, and as given
+    otherwise rather than a guessed link.
+    """
+    uri = _as_uri(identifier)
+    notation: str | dict[str, str] = (
+        {"@value": uri, "@type": "xsd:anyURI"} if uri else identifier
+    )
+    return {"@type": "adms:Identifier", "skos:notation": notation}
+
+
+def _issued_node(issued: date) -> dict[str, str]:
+    """When the resource itself was published, as ``dct:issued``.
+
+    Typed as a date, unlike the catalogue record's ``issued``, which is when FDS
+    listed it.
+    """
+    return {"@value": issued.isoformat(), "@type": "xsd:date"}
+
+
+def _generated_at(activity: "Activity") -> dict[str, str] | None:
+    """When the resource was generated: the end of the activity that produced it.
+
+    Stated on the resource itself so a reader need not open the activity, and
+    derived rather than stored so the two cannot disagree.
+    """
+    if not activity.ended_at:
+        return None
+    return {"@value": activity.ended_at.isoformat(), "@type": "xsd:dateTime"}
 
 
 def _map_scientific_metadata_to_jsonld(metadata: list[Any]) -> list[dict[str, Any]]:
@@ -428,6 +487,10 @@ def device_node(device: Device | DeviceRead, base_url: str) -> dict[str, Any]:
         "publisher": device.publisher,
         "creator": device.creator,
     }
+    if device.persistent_identifier:
+        data["adms:identifier"] = _persistent_identifier_node(
+            device.persistent_identifier
+        )
 
     return {k: v for k, v in data.items() if v is not None}
 
@@ -463,6 +526,12 @@ def map_shot_to_dcat(
         "publisher": shot.publisher,
         "creator": shot.creator,
     }
+    if shot.persistent_identifier:
+        data["adms:identifier"] = _persistent_identifier_node(
+            shot.persistent_identifier
+        )
+    if shot.issued:
+        data["dct:issued"] = _issued_node(shot.issued)
     # dct:temporal → dct:PeriodOfTime. Emit a closed period when an end is known or
     # derivable from the duration; otherwise an open period (start only).
     if shot.shot_at:
@@ -526,6 +595,13 @@ def map_dataset_to_dcat(
         "version": dataset.version,
     }
 
+    if dataset.persistent_identifier:
+        data["adms:identifier"] = _persistent_identifier_node(
+            dataset.persistent_identifier
+        )
+    if dataset.issued:
+        data["dct:issued"] = _issued_node(dataset.issued)
+
     if dataset.access_level:
         data["accessRights"] = dataset.access_level.value
 
@@ -577,6 +653,7 @@ def map_dataset_to_dcat(
     activity: Activity | None = getattr(dataset, "activity", None)
     if activity:
         data["prov:wasGeneratedBy"] = _build_activity_node(activity, base_url)
+        data["prov:generatedAtTime"] = _generated_at(activity)
 
     derivations = getattr(dataset, "derivations", None) or []
     if derivations:
@@ -637,13 +714,18 @@ def map_dataset_to_dcat(
 
 
 def map_source_to_dcat(source: "Source", base_url: str) -> dict[str, Any]:
-    """A Source as a standalone PROV-O agent document.
+    """A Source as a standalone PROV-O document.
 
     The same node that is embedded in the provenance of anything this Source
-    produced, given a context so that the identifier FDS publishes for it
-    resolves to a description rather than to nothing.
+    produced or measured, given a context so that the identifier FDS publishes
+    for it resolves to a description rather than to nothing.
     """
-    return {"@context": METADATA_CONTEXT, **_agent_node(source, base_url)}
+    node = (
+        _instrument_node(source, base_url)
+        if source.kind is SourceKind.INSTRUMENT
+        else _agent_node(source, base_url)
+    )
+    return {"@context": METADATA_CONTEXT, **node}
 
 
 def map_activity_to_dcat(activity: "Activity", base_url: str) -> dict[str, Any]:
@@ -765,6 +847,12 @@ def map_collection_to_dcat(
         "publisher": collection.publisher,
         "creator": collection.creator,
     }
+    if collection.persistent_identifier:
+        data["adms:identifier"] = _persistent_identifier_node(
+            collection.persistent_identifier
+        )
+    if collection.issued:
+        data["dct:issued"] = _issued_node(collection.issued)
 
     if collection.access_level:
         data["accessRights"] = collection.access_level.value
@@ -822,6 +910,7 @@ def map_collection_to_dcat(
     activity: Activity | None = getattr(collection, "activity", None)
     if activity:
         data["prov:wasGeneratedBy"] = _build_activity_node(activity, base_url)
+        data["prov:generatedAtTime"] = _generated_at(activity)
 
     return _with_catalog_record(
         {k: v for k, v in data.items() if v is not None}, collection

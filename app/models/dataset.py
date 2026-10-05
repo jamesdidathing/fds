@@ -1,3 +1,4 @@
+from datetime import date
 from enum import Enum
 from typing import TYPE_CHECKING, Self
 
@@ -16,7 +17,13 @@ from sqlmodel import (
 from app.core.timeutils import UTCDatetime
 
 from .coverage import Coverage
-from .mixins import DescriptiveMixin, ScientificMetadataMixin, TimestampMixin
+from .mixins import (
+    DescriptiveMixin,
+    IssuedMixin,
+    PersistentIdentifierMixin,
+    ScientificMetadataMixin,
+    TimestampMixin,
+)
 from .policy import AccessLevel
 from .scientific_metadata import ScientificProperty
 from .storage_options import StorageOptions, StorageOptionsType
@@ -41,7 +48,13 @@ class DatasetScope(str, Enum):
     SHOT = "shot"
 
 
-class DatasetBase(DescriptiveMixin, ScientificMetadataMixin, SQLModel):
+class DatasetBase(
+    DescriptiveMixin,
+    ScientificMetadataMixin,
+    PersistentIdentifierMixin,
+    IssuedMixin,
+    SQLModel,
+):
     """Core metadata for a dataset (maps to ``dcat:Dataset``).
 
     A Dataset is a metadata container describing *what* the data is.  The
@@ -387,6 +400,8 @@ class DatasetRead(DatasetBase, TimestampMixin):
 
 class DatasetUpdate(SQLModel):
     name: str | None = None
+    persistent_identifier: str | None = None
+    issued: date | None = None
     level: int | None = None
     quality_flag: str | None = None
     temporal_start: UTCDatetime | None = None
