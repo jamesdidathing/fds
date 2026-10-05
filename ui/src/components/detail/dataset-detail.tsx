@@ -1,16 +1,18 @@
 'use client';
 
-import { useState, useEffect, useRef } from 'react';
+import { useState, useEffect, useRef, type ReactNode } from 'react';
 import Link from 'next/link';
-import { Database, Lock, Unlock, Download, Activity, ChevronRight, MapPin, SlidersHorizontal, Highlighter } from 'lucide-react';
+import { Database, Lock, Unlock, Download, Activity, ChevronRight, MapPin, SlidersHorizontal, Highlighter, Copy, Check } from 'lucide-react';
 import { useSession, signIn } from "next-auth/react";
 import useSWR from 'swr';
 import { fetcher, API_BASE } from '@/lib/api';
-import { Activity as ActivityType, Dataset } from '@/lib/types';
+import { Activity as ActivityType, Collection, Dataset, Distribution, Source } from '@/lib/types';
 import ProvenanceGraph from '@/components/ProvenanceGraph';
 import { ScientificMetadata } from '@/components/properties';
 import { RelatedGroup } from '@/components/related-data';
 import { useDeviceLabel } from '@/lib/use-device-label';
+import { citation, resolveIdentifier } from '@/lib/identifiers';
+import type { JsonLd } from '@/lib/identifier-page';
 import { JsonLdPanel } from '@/components/jsonld-panel';
 
 // Heatmap Color Scale Approximation (Viridis)
@@ -103,6 +105,58 @@ function HeatmapCanvas({ data, width, height, title }: HeatmapProps) {
 
 function isZarr(mediaType?: string | null): boolean {
   return Boolean(mediaType?.toLowerCase().includes('zarr'));
+}
+
+// The in-browser reader speaks plain Zarr. An icechunk store is Zarr underneath
+// but only opens through icechunk.
+function canVisualise(d: Distribution): boolean {
+  return isZarr(d.media_type) && !d.media_type!.toLowerCase().includes('icechunk');
+}
+
+function distributionLabel(d: Distribution): string {
+  return d.format || d.media_type || 'Unknown format';
+}
+
+function Property({ label, children, last = false }: { label: string; children: ReactNode; last?: boolean }) {
+  return (
+    <div className={`flex flex-col justify-start py-1 ${last ? '' : 'border-b border-border pb-2'}`}>
+      <span className="text-muted-foreground uppercase text-xs font-bold tracking-wider mb-1">{label}</span>
+      {children}
+    </div>
+  );
+}
+
+const DATE: Intl.DateTimeFormatOptions = { year: 'numeric', month: 'long', day: 'numeric' };
+const INSTANT: Intl.DateTimeFormatOptions = { ...DATE, hour: '2-digit', minute: '2-digit', second: '2-digit', timeZone: 'UTC', timeZoneName: 'short' };
+
+function CopyButton({ value }: { value: string }) {
+  const [copied, setCopied] = useState(false);
+  const copy = async () => {
+    try {
+      await navigator.clipboard.writeText(value);
+      setCopied(true);
+      setTimeout(() => setCopied(false), 1500);
+    } catch {
+      // Clipboard access is denied outside a secure context; the value is
+      // still on the page to select.
+    }
+  };
+  return (
+    <button type="button" onClick={copy} aria-label="Copy" className="shrink-0 text-muted-foreground hover:text-foreground transition-colors">
+      {copied ? <Check className="w-3.5 h-3.5" /> : <Copy className="w-3.5 h-3.5" />}
+    </button>
+  );
+}
+
+// One line however long the value, so it cannot spill out of a narrow card.
+// The whole of it is in the tooltip and on the clipboard.
+function TruncatedValue({ value }: { value: string }) {
+  return (
+    <span className="flex items-center gap-2">
+      <span className="font-mono text-foreground truncate" title={value}>{value}</span>
+      <CopyButton value={value} />
+    </span>
+  );
 }
 
 // How to open one dataset's bytes: either short-lived credentials FDS minted, or
@@ -310,58 +364,147 @@ function makeZarrStore(opts: {
   };
 }
 
-function buildSnippet(
-  mediaType: string | null | undefined,
-  access: DataAccess,
-  s3Path: string,
-): string {
+function isHttp(url: string): boolean {
+  return /^https?:\/\//.test(url);
+}
+
+function isIcechunk(d: Distribution): boolean {
+  return d.storage_options_type === 'icechunk_s3' || Boolean(d.media_type?.toLowerCase().includes('icechunk'));
+}
+
+// "s3://bucket/some/prefix/" as its bucket and the key under it.
+function splitS3(url: string): { bucket: string; key: string } {
+  const rest = url.replace(/^s3:\/\//, '');
+  const i = rest.indexOf('/');
+  return i === -1
+    ? { bucket: rest, key: '' }
+    : { bucket: rest.slice(0, i), key: rest.slice(i + 1).replace(/\/$/, '') };
+}
+
+function fsspecOptions(access: DataAccess): string {
   // Public data in someone else's store needs no credentials at all, so the
   // snippet has to show anonymous access rather than empty credential fields.
-  const storageOptions = access.anon
+  return access.anon
     ? `storage_options = {
     "anon": True,
-    "client_kwargs": {
-        "endpoint_url": "${access.endpointUrl}"
-    }
+    "client_kwargs": {"endpoint_url": "${access.endpointUrl}"},
 }`
     : `storage_options = {
     "key": "${access.accessKeyId}",
     "secret": "${access.secretAccessKey}",
     "token": "${access.sessionToken}",
-    "client_kwargs": {
-        "endpoint_url": "${access.endpointUrl}"
-    }
+    "client_kwargs": {"endpoint_url": "${access.endpointUrl}"},
 }`;
+}
 
-  if (isZarr(mediaType)) {
-    return `import xarray as xr
-
-${storageOptions}
-
-ds = xr.open_zarr("${s3Path}", storage_options=storage_options)
-print(ds)`;
-  }
-
-  // NetCDF / HDF5: fs.cat + BytesIO avoids the HeadObject call that
-  // xr.open_dataset(s3_url, ...) makes, our STS session policy grants
-  // s3:GetObject only.
-  return `import io
-
-import s3fs
+// An icechunk dataset is often a group in a larger store, the collection's
+// root_url, so the store is opened there and the rest of the path is the group.
+function icechunkSnippet(url: string, access: DataAccess, storeRoot?: string): string {
+  const root = storeRoot && url.startsWith(storeRoot) ? storeRoot : url;
+  const group = url.slice(root.length).replace(/^\/|\/$/g, '');
+  const { bucket, key } = splitS3(root);
+  const endpoint = new URL(access.endpointUrl);
+  const onAws = endpoint.hostname === 'amazonaws.com' || endpoint.hostname.endsWith('.amazonaws.com');
+  const args = [
+    `bucket="${bucket}"`,
+    `prefix="${key}"`,
+    `endpoint_url="${access.endpointUrl}"`,
+    // Without a region icechunk first asks the AWS instance metadata service,
+    // which is not there off AWS and costs a timeout.
+    `region="${access.region || 'us-east-1'}"`,
+    ...(access.anon
+      ? ['anonymous=True']
+      : [
+          `access_key_id="${access.accessKeyId}"`,
+          `secret_access_key="${access.secretAccessKey}"`,
+          `session_token="${access.sessionToken}"`,
+        ]),
+    ...(endpoint.protocol === 'http:' ? ['allow_http=True'] : []),
+    // Any S3-compatible store other than AWS needs path-style addressing.
+    ...(onAws ? [] : ['force_path_style=True']),
+  ];
+  return `# pip install icechunk xarray
+import icechunk
 import xarray as xr
 
-${storageOptions}
-
-fs = s3fs.S3FileSystem(**storage_options)
-data = fs.cat("${s3Path}")
-ds = xr.open_dataset(io.BytesIO(data), engine="h5netcdf")
+storage = icechunk.s3_storage(
+${args.map((a) => `    ${a},`).join('\n')}
+)
+repo = icechunk.Repository.open(storage)
+session = repo.readonly_session("main")
+ds = xr.open_zarr(session.store${group ? `, group="${group}"` : ''}, consolidated=False)
 print(ds)`;
 }
 
-export default function DatasetDetail({ id }: { id: string }) {
+function buildSnippet(dist: Distribution, access: DataAccess, storeRoot?: string): string {
+  const url = dist.url;
+  const mediaType = (dist.media_type ?? '').toLowerCase();
+  const format = (dist.format ?? '').toLowerCase();
+
+  if (isIcechunk(dist)) return icechunkSnippet(url, access, storeRoot);
+
+  const options = fsspecOptions(access);
+
+  if (isZarr(mediaType)) {
+    return `# pip install xarray zarr s3fs
+import xarray as xr
+
+${options}
+
+ds = xr.open_zarr("${url}", storage_options=storage_options)
+print(ds)`;
+  }
+
+  if (mediaType.includes('csv') || format.includes('csv')) {
+    return `# pip install pandas s3fs
+import pandas as pd
+
+${options}
+
+df = pd.read_csv("${url}", storage_options=storage_options)
+print(df)`;
+  }
+
+  if (mediaType.includes('parquet') || format.includes('parquet')) {
+    return `# pip install pandas s3fs
+import pandas as pd
+
+${options}
+
+df = pd.read_parquet("${url}", storage_options=storage_options)
+print(df)`;
+  }
+
+  if (/netcdf|hdf/.test(mediaType) || /netcdf|hdf/.test(format)) {
+    return `# pip install xarray h5netcdf h5py s3fs
+import s3fs
+import xarray as xr
+
+${options}
+
+fs = s3fs.S3FileSystem(**storage_options)
+ds = xr.open_dataset(fs.open("${url}"), engine="h5netcdf")
+print(ds)`;
+  }
+
+  return `# pip install s3fs
+import s3fs
+
+${options}
+
+fs = s3fs.S3FileSystem(**storage_options)
+data = fs.cat("${url}")  # ${dist.media_type || 'unknown format'}: open these bytes with a reader for it
+`;
+}
+
+export default function DatasetDetail({ id, jsonLd }: { id: string; jsonLd?: JsonLd | null }) {
 
   const { status } = useSession();
-  const [accessValues, setAccessValues] = useState<{granted: boolean, token?: DataAccess, s3Path?: string, error?: string}>({ granted: false });
+  // Access is decided for the dataset as a whole, so one request covers every
+  // distribution. byUrl says how to open each one FDS granted.
+  const [accessValues, setAccessValues] = useState<{granted: boolean, byUrl: Record<string, DataAccess>, error?: string}>({ granted: false, byUrl: {} });
+  const [selectedDistId, setSelectedDistId] = useState<number | null>(null);
+  const [showGraph, setShowGraph] = useState(false);
   const [zarrMetadata, setZarrMetadata] = useState<NodeMeta | null>(null);
   const [showCodeModal, setShowCodeModal] = useState(false);
   const [variables, setVariables] = useState<string[]>([]);
@@ -377,7 +520,7 @@ export default function DatasetDetail({ id }: { id: string }) {
 
   const { data: datasetData } = useSWR<Dataset>(
     id
-      ? `${API_BASE}/datasets/id/${id}?include_geometry=true&include_calibration=true&include_annotations=true&include_storage_options=true`
+      ? `${API_BASE}/datasets/id/${id}?include_geometry=true&include_calibration=true&include_annotations=true`
       : null,
     fetcher
   );
@@ -387,9 +530,40 @@ export default function DatasetDetail({ id }: { id: string }) {
     fetcher
   );
 
+  const { data: executor } = useSWR<Source>(
+    activityData?.source_id != null ? `${API_BASE}/sources/id/${activityData.source_id}` : null,
+    fetcher
+  );
+
+  // Default first, so it is what is selected and, when it is Zarr, what is plotted.
+  const distributions = [...(datasetData?.distributions ?? [])].sort(
+    (a, b) => Number(b.default_distribution) - Number(a.default_distribution)
+  );
+  const selectedDist = distributions.find((d) => d.id === selectedDistId) ?? distributions[0];
+  const selectedAccess = selectedDist ? accessValues.byUrl[selectedDist.url] : undefined;
+  // Distributions are interchangeable, so any Zarr one can be plotted, whichever
+  // is selected.
+  const vizDist = distributions.find(canVisualise);
+  const vizAccess = vizDist ? accessValues.byUrl[vizDist.url] : undefined;
+
+  const cite = datasetData ? citation(datasetData) : null;
+
   const device = datasetData?.device_name;
   const shot = datasetData?.shot_id;
   const deviceLabel = useDeviceLabel(device);
+
+  // An icechunk dataset may be a group in its collection's store, whose root is
+  // the collection's root_url.
+  const { data: shotCollections } = useSWR<Collection[]>(
+    selectedDist && isIcechunk(selectedDist) && device && shot
+      ? `${API_BASE}/devices/${device}/shots/${shot}/collections`
+      : null,
+    fetcher
+  );
+  const storeRoot = (shotCollections ?? [])
+    .map((c) => c.root_url)
+    .filter((r): r is string => Boolean(r) && Boolean(selectedDist?.url.startsWith(r as string)))
+    .sort((a, b) => b.length - a.length)[0];
 
   const handleRequestAccess = async () => {
       if (datasetData?.effective_access_level !== "public" && status !== "authenticated") {
@@ -397,67 +571,86 @@ export default function DatasetDetail({ id }: { id: string }) {
           return;
       }
 
-      const s3Path = datasetData?.url;
-      if (!s3Path) {
-          setAccessValues({ granted: false, error: "Dataset has no data URL." });
+      if (distributions.length === 0) {
+          setAccessValues({ granted: false, byUrl: {}, error: "Dataset has no data URL." });
           return;
       }
 
-      // Public data carries its own anonymous storage options, so there is
-      // nothing to vend and no round trip to make. This is the path a dataset
-      // held in another organisation's public store takes.
-      const publicOpts = datasetData?.storage_options;
-      if (datasetData?.effective_access_level === 'public' && publicOpts?.anon) {
-          const access: DataAccess = {
-              endpointUrl: publicOpts.client_kwargs?.endpoint_url ?? MINIO_FALLBACK,
-              anon: true,
-              region: publicOpts.client_kwargs?.region_name,
-          };
-          setAccessValues({ granted: true, token: access, s3Path });
-          loadZarrData(access, s3Path);
-          return;
-      }
-
-      try {
-          const res = await fetch(`${API_BASE}/file-access/credentials`, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ device_name: device, shot_id: shot })
-          });
-
-          if (!res.ok) throw new Error("Failed to get credentials");
-
-          const manifest = await res.json();
-
-          // resource_map maps URL → credential directly
-          const validCreds = manifest.resource_map[s3Path] ?? null;
-
-          if (validCreds) {
-             const access: DataAccess = {
-                 endpointUrl: validCreds.endpoint_url ?? MINIO_FALLBACK,
-                 anon: false,
-                 accessKeyId: validCreds.access_key_id,
-                 secretAccessKey: validCreds.secret_access_key,
-                 sessionToken: validCreds.session_token,
-                 region: validCreds.region,
-             };
-             setAccessValues({ granted: true, token: access, s3Path });
-             loadZarrData(access, s3Path);
+      // Public data in an S3 store opens anonymously, with nothing to vend and
+      // no round trip to make. This is the path a dataset held in another
+      // organisation's public store takes.
+      const isPublic = datasetData?.effective_access_level === 'public';
+      const byUrl: Record<string, DataAccess> = {};
+      const toVend: string[] = [];
+      for (const d of distributions) {
+          // An HTTPS download is opened by its URL, with nothing to grant.
+          if (isHttp(d.url)) continue;
+          if (isPublic) {
+              byUrl[d.url] = {
+                  endpointUrl: d.endpoint_url ?? MINIO_FALLBACK,
+                  anon: true,
+                  region: d.region ?? undefined,
+              };
           } else {
-             setAccessValues({ granted: false, error: "No valid token retrieved for this dataset." });
+              toVend.push(d.url);
           }
-
-      } catch (e) {
-          console.error(e);
-          setAccessValues({ granted: false, error: e instanceof Error ? e.message : String(e) });
       }
+
+      let error: string | undefined;
+      if (toVend.length > 0) {
+          try {
+              const res = await fetch(`${API_BASE}/file-access/credentials`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ data_urls: toVend })
+              });
+
+              if (!res.ok) throw new Error("Failed to get credentials");
+
+              const manifest = await res.json();
+              for (const url of toVend) {
+                  const cred = manifest.resource_map[url];
+                  if (!cred) continue;
+                  byUrl[url] = {
+                      endpointUrl: cred.endpoint_url ?? MINIO_FALLBACK,
+                      anon: false,
+                      accessKeyId: cred.access_key_id,
+                      secretAccessKey: cred.secret_access_key,
+                      sessionToken: cred.session_token,
+                      region: cred.region,
+                  };
+              }
+          } catch (e) {
+              console.error(e);
+              error = e instanceof Error ? e.message : String(e);
+          }
+      }
+
+      if (toVend.length > 0 && Object.keys(byUrl).length === 0) {
+          setAccessValues({ granted: false, byUrl: {}, error: error ?? "FDS issued no credentials for this dataset." });
+          return;
+      }
+      setAccessValues({ granted: true, byUrl });
+      if (vizDist && byUrl[vizDist.url]) loadZarrData(byUrl[vizDist.url], vizDist.url);
   };
 
   const [autoLoadAttempted, setAutoLoadAttempted] = useState(false);
 
   useEffect(() => {
+      if (!showGraph && !showCodeModal) return;
+      const onKey = (e: KeyboardEvent) => {
+          if (e.key !== 'Escape') return;
+          setShowGraph(false);
+          setShowCodeModal(false);
+      };
+      window.addEventListener('keydown', onKey);
+      return () => window.removeEventListener('keydown', onKey);
+  }, [showGraph, showCodeModal]);
+
+  useEffect(() => {
      if (datasetData && status !== "loading" && !autoLoadAttempted && !accessValues.granted && !accessValues.error) {
-         if (isZarr(datasetData.media_type) && (datasetData.effective_access_level === 'public' || status === "authenticated")) {
+         // Public data opens without asking, so there is nothing to click for.
+         if (datasetData.effective_access_level === 'public' || (vizDist && status === "authenticated")) {
              setAutoLoadAttempted(true);
              handleRequestAccess();
          }
@@ -686,10 +879,9 @@ export default function DatasetDetail({ id }: { id: string }) {
 
   const onSelectVariable = async (newVar: string) => {
       setSelectedVar(newVar);
-      if (!accessValues.token || !accessValues.s3Path) return;
+      if (!vizAccess || !vizDist) return;
 
-      const access = accessValues.token as DataAccess;
-      const { path: prefixPath } = objectUrl(access.endpointUrl, accessValues.s3Path);
+      const { path: prefixPath } = objectUrl(vizAccess.endpointUrl, vizDist.url);
 
       // Use the metadata resolved when the dataset was opened. Re-deriving it from
       // the group's own zarr.json loses everything for a store that consolidates
@@ -697,29 +889,28 @@ export default function DatasetDetail({ id }: { id: string }) {
       // axes and no sliders.
       const items = groupMeta.current?.items;
       if (!items) return;
-      fetchVariables(access, prefixPath, newVar, coordinates, items);
+      fetchVariables(vizAccess, prefixPath, newVar, coordinates, items);
   };
 
   return (
     <div className="container mx-auto px-4 py-8 max-w-7xl">
       {/* Code Snippet Modal */}
-      {showCodeModal && accessValues.token && (
-        <div className="fixed inset-0 bg-black/80 z-50 flex items-center justify-center p-4 backdrop-blur-sm">
-          <div className="bg-card border border-border rounded-xl max-w-3xl w-full shadow-2xl relative overflow-hidden animate-fade-in">
+      {showCodeModal && selectedDist && selectedAccess && (
+        <div onClick={() => setShowCodeModal(false)} className="fixed inset-0 bg-black/80 z-50 flex items-center justify-center p-4 backdrop-blur-sm">
+          <div onClick={(e) => e.stopPropagation()} className="bg-card border border-border rounded-xl max-w-3xl w-full shadow-2xl relative overflow-hidden animate-fade-in">
               <div className="flex justify-between items-center bg-muted p-4 border-b border-border">
-                  <h3 className="text-lg font-bold text-foreground flex items-center gap-2"><Activity className="w-5 h-5 text-primary"/> Connect via Python (Xarray)</h3>
+                  <h3 className="text-lg font-bold text-foreground flex items-center gap-2"><Activity className="w-5 h-5 text-primary"/> Open in Python</h3>
                   <button onClick={() => setShowCodeModal(false)} className="text-muted-foreground hover:text-foreground text-2xl leading-none">&times;</button>
               </div>
               <div className="p-6">
                   <p className="text-sm text-foreground mb-4">
-                      To prevent dark repositories and ensure you always analyze the latest version of the data, we recommend streaming directly into Python.
-                      {(accessValues.token as DataAccess | null)?.anon
-                        ? " This data is openly published, so it opens anonymously: no credentials, and the read goes straight to the store holding it."
-                        : " Your temporary access token has been injected below."}
+                      {selectedAccess.anon
+                        ? "This data is openly published, so it opens anonymously, straight from the store holding it."
+                        : "The credentials below were issued to you and expire. Do not share them or commit them to version control."}
                   </p>
                   <div className="bg-background p-4 rounded-lg overflow-x-auto border border-border relative group">
                       {(() => {
-                          const snippet = buildSnippet(datasetData?.media_type, accessValues.token as DataAccess, accessValues.s3Path!);
+                          const snippet = buildSnippet(selectedDist, selectedAccess, storeRoot);
                           return (
                               <>
                                   <button
@@ -731,10 +922,20 @@ export default function DatasetDetail({ id }: { id: string }) {
                           );
                       })()}
                   </div>
-                  <div className="mt-4 bg-muted border border-border p-3 rounded flex gap-3 text-sm text-foreground">
-                      <span className="font-bold shrink-0">Note:</span>
-                      <p>This S3 STS token is temporary and scoped exclusively to your authenticated identity profile. Do not commit this code snippet to version control.</p>
-                  </div>
+              </div>
+          </div>
+        </div>
+      )}
+
+      {showGraph && datasetData?.id && (
+        <div onClick={() => setShowGraph(false)} className="fixed inset-0 bg-black/80 z-50 flex items-center justify-center p-4 backdrop-blur-sm">
+          <div onClick={(e) => e.stopPropagation()} className="bg-card border border-border rounded-xl max-w-6xl w-full shadow-2xl relative overflow-hidden animate-fade-in">
+              <div className="flex justify-between items-center bg-muted p-4 border-b border-border">
+                  <h3 className="text-lg font-bold text-foreground flex items-center gap-2"><Activity className="w-5 h-5 text-primary"/> Provenance Graph</h3>
+                  <button onClick={() => setShowGraph(false)} className="text-muted-foreground hover:text-foreground text-2xl leading-none">&times;</button>
+              </div>
+              <div className="p-6">
+                  <ProvenanceGraph datasetId={datasetData.id} />
               </div>
           </div>
         </div>
@@ -763,13 +964,14 @@ export default function DatasetDetail({ id }: { id: string }) {
             <Database className="text-primary w-8 h-8" />
             {datasetData?.name || id}
          </h1>
-         <p className="text-lg text-foreground max-w-4xl leading-relaxed mb-6">
-            {datasetData?.description || "Scientific data array containing experimental measurements from the plasma discharge."}
-         </p>
+         {datasetData?.description && (
+           <p className="text-lg text-foreground max-w-4xl leading-relaxed mb-6">
+              {datasetData.description}
+           </p>
+         )}
          <div className="flex flex-wrap gap-3">
              {device && <span className="bg-muted text-foreground px-3 py-1 rounded-full text-sm border border-border font-mono">Device: {deviceLabel}</span>}
              {shot && <span className="bg-muted text-foreground px-3 py-1 rounded-full text-sm border border-border font-mono">Shot: {shot}</span>}
-             {datasetData?.publisher && <span className="bg-muted text-foreground px-3 py-1 rounded-full text-sm border border-border">Publisher: {datasetData.publisher}</span>}
              {datasetData?.annotates && (
                 <span className="bg-muted text-foreground px-3 py-1 rounded-full text-sm border border-border flex items-center gap-1">
                     <Highlighter className="w-3.5 h-3.5" />
@@ -779,11 +981,278 @@ export default function DatasetDetail({ id }: { id: string }) {
          </div>
       </div>
 
-      <div className={datasetData && !isZarr(datasetData.media_type) ? 'max-w-3xl' : 'grid grid-cols-1 lg:grid-cols-3 gap-8'}>
+      <div className={datasetData && !vizDist ? 'max-w-3xl' : 'grid grid-cols-1 lg:grid-cols-3 gap-8'}>
 
-        {/* Left Column: Zarr Visualizer (only rendered for Zarr datasets) */}
-        {(!datasetData || isZarr(datasetData.media_type)) && (
-          <div className="lg:col-span-2">
+        {/* Left Column: Metadata & Controls Sidebar */}
+        <div className="space-y-6">
+
+            <div className="card p-6 bg-card/60 shadow-xl border-border overflow-hidden">
+                <h3 className="text-lg font-bold mb-4 border-b border-border pb-2 text-foreground">Dataset Properties</h3>
+                <div className="space-y-3 text-sm">
+                    {datasetData?.persistent_identifier && (() => {
+                        const href = resolveIdentifier(datasetData.persistent_identifier);
+                        return (
+                            <Property label="Persistent identifier">
+                                {href
+                                    ? <a href={href} className="font-mono text-primary hover:text-foreground break-all">{href}</a>
+                                    : <span className="font-mono text-foreground break-all">{datasetData.persistent_identifier}</span>}
+                            </Property>
+                        );
+                    })()}
+                    {datasetData?.creator && <Property label="Creator"><span className="text-foreground">{datasetData.creator}</span></Property>}
+                    {datasetData?.issued && (
+                        <Property label="Published">
+                            {/* A calendar date: read as UTC so no timezone shifts it a day. */}
+                            <span className="text-foreground">{new Date(datasetData.issued).toLocaleDateString(undefined, { ...DATE, timeZone: 'UTC' })}</span>
+                        </Property>
+                    )}
+                    {datasetData?.license && (
+                        <Property label="Licence">
+                            {/^https?:\/\//.test(datasetData.license)
+                                ? <a href={datasetData.license} className="text-primary hover:text-foreground break-all">{datasetData.license}</a>
+                                : <span className="text-foreground">{datasetData.license}</span>}
+                        </Property>
+                    )}
+                    <Property label="Access level">
+                        <span className="text-foreground capitalize">{datasetData?.effective_access_level || datasetData?.access_level || 'Unknown'}</span>
+                    </Property>
+                    {activityData?.ended_at && (
+                        <Property label="Generated">
+                            <Link href={`/activities/${activityData.id}`} className="text-primary hover:text-foreground">
+                                {new Date(activityData.ended_at).toLocaleString(undefined, INSTANT)}
+                            </Link>
+                        </Property>
+                    )}
+                    {datasetData?.version && <Property label="Version"><span className="text-foreground">{datasetData.version}</span></Property>}
+                    {datasetData?.publisher && <Property label="Publisher"><span className="text-foreground">{datasetData.publisher}</span></Property>}
+                    {(datasetData?.temporal_start || datasetData?.temporal_end) && (
+                        <Property label="Temporal coverage">
+                            <span className="text-foreground">
+                                {datasetData.temporal_start ? new Date(datasetData.temporal_start).toLocaleString(undefined, INSTANT) : 'unknown'}
+                                {' to '}
+                                {datasetData.temporal_end ? new Date(datasetData.temporal_end).toLocaleString(undefined, INSTANT) : 'unknown'}
+                            </span>
+                        </Property>
+                    )}
+                    {datasetData?.keywords && (
+                        <Property label="Keywords">
+                            <span className="flex flex-wrap gap-1.5">
+                                {datasetData.keywords.split(',').map((k) => k.trim()).filter(Boolean).map((k) => (
+                                    <span key={k} className="text-xs bg-muted border border-border rounded-full px-2 py-0.5 text-foreground">{k}</span>
+                                ))}
+                            </span>
+                        </Property>
+                    )}
+                    {datasetData?.quality_flag && <Property label="Quality"><span className="text-foreground">{datasetData.quality_flag}</span></Property>}
+                    <Property label="Listed in FDS" last>
+                        <span className="text-foreground">{datasetData?.created_at ? new Date(datasetData.created_at).toLocaleDateString(undefined, DATE) : 'Unknown'}</span>
+                    </Property>
+                </div>
+                <JsonLdPanel url={`${API_BASE}/datasets/id/${id}`} document={jsonLd} className="-mx-6 -mb-6 mt-4 border-t border-border px-2 py-1.5" />
+            </div>
+
+            <div className="card p-6 bg-muted/80 shadow-xl border-border">
+                <h3 className="text-lg font-bold mb-4 flex items-center justify-between text-foreground">
+                    Data Access
+                    {selectedAccess || (selectedDist && isHttp(selectedDist.url)) ? <Unlock className="w-5 h-5 text-foreground" /> : <Lock className="w-5 h-5 text-muted-foreground" />}
+                </h3>
+
+                {distributions.length > 1 && (
+                    <div className="mb-6">
+                        <p className="text-muted-foreground uppercase text-xs font-bold tracking-wider mb-2">
+                            Distributions ({distributions.length})
+                        </p>
+                        <div className="space-y-1" role="radiogroup" aria-label="Distribution">
+                            {distributions.map((d) => {
+                                const selected = d.id === selectedDist?.id;
+                                return (
+                                    <button
+                                        key={d.id}
+                                        role="radio"
+                                        aria-checked={selected}
+                                        onClick={() => setSelectedDistId(d.id)}
+                                        className={`w-full text-left px-3 py-2 rounded border text-sm flex items-center gap-2 transition-colors ${selected ? 'border-primary bg-card' : 'border-border hover:bg-card/60'}`}
+                                    >
+                                        <span className={`w-3 h-3 shrink-0 rounded-full border ${selected ? 'border-primary bg-primary' : 'border-muted-foreground'}`} />
+                                        <span className="flex-1 min-w-0">
+                                            <span className="block text-foreground truncate">{distributionLabel(d)}</span>
+                                            {d.format && d.media_type && (
+                                                <span className="block text-xs text-muted-foreground font-mono truncate">{d.media_type}</span>
+                                            )}
+                                        </span>
+                                        {d.default_distribution && (
+                                            <span className="text-[10px] uppercase tracking-wider text-muted-foreground border border-border rounded px-1">Default</span>
+                                        )}
+                                        {d.id === vizDist?.id && (
+                                            <span className="text-[10px] uppercase tracking-wider text-primary border border-primary/50 rounded px-1">Plotted</span>
+                                        )}
+                                    </button>
+                                );
+                            })}
+                        </div>
+                    </div>
+                )}
+
+                {distributions.length === 1 && selectedDist && (
+                    <div className="space-y-1 text-xs mb-4">
+                        <p className="text-muted-foreground font-medium uppercase tracking-wider">Format</p>
+                        <p className="text-sm text-foreground">
+                            {distributionLabel(selectedDist)}
+                            {selectedDist.format && selectedDist.media_type && (
+                                <span className="text-xs text-muted-foreground font-mono ml-2">{selectedDist.media_type}</span>
+                            )}
+                        </p>
+                    </div>
+                )}
+
+                {selectedDist && (
+                    <div className="space-y-2 text-xs">
+                        <p className="text-muted-foreground font-medium uppercase tracking-wider">URI</p>
+                        <p className="break-all text-foreground font-mono bg-card border border-border p-2 rounded">{selectedDist.url}</p>
+                    </div>
+                )}
+
+                {selectedDist && isHttp(selectedDist.url) ? (
+                    <a href={selectedDist.url} target="_blank" rel="noopener noreferrer" className="text-sm text-primary hover:text-foreground inline-flex items-center gap-1 mt-3">
+                        <Download className="w-4 h-4" /> Download
+                    </a>
+                ) : selectedAccess ? (
+                    <button onClick={() => setShowCodeModal(true)} className="text-sm text-primary hover:text-foreground inline-flex items-center gap-1 mt-3">
+                        <Download className="w-4 h-4" /> Open in Python
+                    </button>
+                ) : accessValues.granted ? (
+                    <p className="text-sm text-muted-foreground mt-3">FDS issued no credentials for this distribution.</p>
+                ) : selectedDist && datasetData?.effective_access_level !== 'public' ? (
+                    <div className="mt-4">
+                        <p className="text-muted-foreground text-sm mb-4 leading-relaxed">
+                            This data is restricted. Sign in with an account that has access, and FDS issues you temporary credentials for reading it.
+                        </p>
+                        {accessValues.error && <p className="text-destructive mb-4 text-sm bg-destructive/10 p-2 rounded border border-destructive/40">{accessValues.error}</p>}
+                        <button
+                            onClick={handleRequestAccess}
+                            className="bg-primary hover:bg-primary/90 text-primary-foreground font-bold py-3 px-4 rounded w-full transition-colors flex items-center justify-center gap-2 shadow-lg hover:shadow-primary/25"
+                        >
+                            <Unlock className="w-4 h-4" />
+                            {status === "authenticated" ? "Get access" : "Sign in to access"}
+                        </button>
+                    </div>
+                ) : null}
+            </div>
+
+            {/* Annotations on this dataset's own axes */}
+            <ScientificMetadata properties={datasetData?.scientific_metadata} className="bg-card/60 shadow-xl border-border" />
+
+            {/* Datasets resolved for this one. The annotations are those whose
+                subject is this dataset — the shot's are resolved on the shot,
+                on its axes, and deliberately not folded in here. */}
+            {((datasetData?.geometry?.length ?? 0) > 0 || (datasetData?.calibration?.length ?? 0) > 0 || (datasetData?.annotations?.length ?? 0) > 0) && (
+                <div className="card p-6 bg-card/60 shadow-xl border-border">
+                    <h3 className="text-lg font-bold mb-4 border-b border-border pb-2 text-foreground">Related Data</h3>
+                    <div className="space-y-4 text-sm">
+                        <RelatedGroup icon={MapPin} label="Geometry" datasets={datasetData?.geometry} />
+                        <RelatedGroup
+                            icon={SlidersHorizontal}
+                            label="Calibration"
+                            hint="— applied in order"
+                            datasets={datasetData?.calibration}
+                        />
+                        <RelatedGroup
+                            icon={Highlighter}
+                            label="Annotations"
+                            hint="— on this dataset's axes"
+                            datasets={datasetData?.annotations}
+                        />
+                    </div>
+                </div>
+            )}
+
+            {/* Provenance Card */}
+            <div className="card p-6 bg-card/60 shadow-xl border-border">
+                <h3 className="text-lg font-bold mb-4 border-b border-border pb-2 text-foreground flex items-center gap-2">
+                    <Activity className="w-5 h-5 text-muted-foreground" /> Provenance
+                </h3>
+                {activityData ? (
+                    <div className="space-y-3 text-sm">
+                        {activityData.activity_type && (
+                            <div className="flex flex-col justify-start py-1 border-b border-border pb-2">
+                                <span className="text-muted-foreground uppercase text-xs font-bold tracking-wider mb-1">Activity Type</span>
+                                <span className="text-foreground">{activityData.activity_type}</span>
+                            </div>
+                        )}
+                        {activityData.source_version && (
+                            <div className="flex flex-col justify-start py-1 border-b border-border pb-2">
+                                <span className="text-muted-foreground uppercase text-xs font-bold tracking-wider mb-1">Source Version</span>
+                                <TruncatedValue value={activityData.source_version} />
+                            </div>
+                        )}
+                        {activityData.started_at && (
+                            <div className="flex flex-col justify-start py-1 border-b border-border pb-2">
+                                <span className="text-muted-foreground uppercase text-xs font-bold tracking-wider mb-1">Started</span>
+                                <span className="text-foreground">{new Date(activityData.started_at).toLocaleString()}</span>
+                            </div>
+                        )}
+                        {activityData.ended_at && (
+                            <div className="flex flex-col justify-start py-1 border-b border-border pb-2">
+                                <span className="text-muted-foreground uppercase text-xs font-bold tracking-wider mb-1">Ended</span>
+                                <span className="text-foreground">{new Date(activityData.ended_at).toLocaleString()}</span>
+                            </div>
+                        )}
+                        {activityData.parameters && Object.keys(activityData.parameters).length > 0 && (
+                            <div className="flex flex-col justify-start py-1">
+                                <span className="text-muted-foreground uppercase text-xs font-bold tracking-wider mb-1">Parameters</span>
+                                <pre className="text-xs text-foreground font-mono bg-background border border-border p-2 rounded overflow-x-auto">
+                                    {JSON.stringify(activityData.parameters, null, 2)}
+                                </pre>
+                            </div>
+                        )}
+                        {executor && (
+                            <Link
+                                href={`/sources/${executor.id}`}
+                                className="text-xs text-primary hover:text-foreground flex items-center gap-1 mt-2 transition-colors"
+                            >
+                                Source: {executor.name} <ChevronRight className="w-3 h-3" />
+                            </Link>
+                        )}
+                        <Link
+                            href={`/activities/${activityData.id}`}
+                            className="text-xs text-primary hover:text-foreground flex items-center gap-1 transition-colors"
+                        >
+                            View activity <ChevronRight className="w-3 h-3" />
+                        </Link>
+                        {datasetData?.id && (
+                            <button
+                                onClick={() => setShowGraph(true)}
+                                className="text-xs text-primary hover:text-foreground flex items-center gap-1 transition-colors"
+                            >
+                                Show provenance graph <ChevronRight className="w-3 h-3" />
+                            </button>
+                        )}
+                    </div>
+                ) : datasetData?.activity_id ? (
+                    <p className="text-muted-foreground text-sm">Loading provenance...</p>
+                ) : (
+                    <div className="text-center py-4 bg-card/30 rounded-lg border border-dashed border-border">
+                        <p className="text-xs text-muted-foreground">No provenance recorded for this dataset.</p>
+                    </div>
+                )}
+            </div>
+
+            {cite && (
+                <div className="card p-6 bg-card/60 shadow-xl border-border">
+                    <h3 className="text-lg font-bold mb-4 border-b border-border pb-2 text-foreground flex items-center justify-between">
+                        Cite this dataset
+                        <CopyButton value={cite} />
+                    </h3>
+                    <p className="text-sm text-foreground leading-relaxed break-words">{cite}</p>
+                </div>
+            )}
+
+        </div>
+
+        {/* Right Column: Zarr Visualizer (only rendered when a distribution is Zarr) */}
+        {(!datasetData || vizDist) && (
+          // Sticky, so it stays in view beside a metadata column taller than it.
+          <div className="lg:col-span-2 lg:sticky lg:top-20 self-start">
             <div className="card h-[650px] flex flex-col relative overflow-hidden shadow-2xl shadow-black/50 border border-border">
                 <div className="absolute inset-0 bg-background/80 z-0">
                     {/* Grid Background Pattern */}
@@ -802,17 +1271,17 @@ export default function DatasetDetail({ id }: { id: string }) {
                 </div>
 
                 <div className="flex-1 flex items-center justify-center relative z-10">
-                    {!accessValues.granted ? (
+                    {!vizAccess ? (
                         <div className="text-center p-8 bg-card/50 backdrop-blur border border-border rounded-lg max-w-md">
                             <Lock className="w-12 h-12 text-muted-foreground mx-auto mb-4" />
                             <h4 className="text-lg font-bold text-foreground mb-2">Data Locked</h4>
-                            <p className="text-muted-foreground text-sm mb-6">Authenticate to decrypt and visualize this Zarr store natively in your browser.</p>
+                            <p className="text-muted-foreground text-sm mb-6">Sign in with an account that has access to plot this data in your browser.</p>
                             <button
                                 onClick={handleRequestAccess}
-                                className="bg-primary hover:bg-accent text-foreground font-bold py-2 px-6 rounded transition-colors flex items-center justify-center gap-2 mx-auto"
+                                className="bg-primary hover:bg-primary/90 text-primary-foreground font-bold py-2 px-6 rounded transition-colors flex items-center justify-center gap-2 mx-auto"
                             >
                                 <Unlock className="w-4 h-4" />
-                                {status === "authenticated" ? "Grant Access" : "Sign In"}
+                                {status === "authenticated" ? "Get access" : "Sign in"}
                             </button>
                         </div>
                     ) : (
@@ -1050,171 +1519,8 @@ export default function DatasetDetail({ id }: { id: string }) {
           </div>
         )}
 
-        {/* Right Column: Metadata & Controls Sidebar */}
-        <div className="space-y-6">
-
-            <div className="card p-6 border-t-4 border-t-primary bg-muted/80 shadow-xl border-border">
-                <h3 className="text-lg font-bold mb-4 flex items-center justify-between text-foreground">
-                    Data Access
-                    {accessValues.granted ? <Unlock className="w-5 h-5 text-foreground" /> : <Lock className="w-5 h-5 text-muted-foreground" />}
-                </h3>
-
-                {!accessValues.granted ? (
-                    <div className="text-left">
-                        <p className="text-muted-foreground text-sm mb-6 leading-relaxed">
-                          {datasetData?.effective_access_level === 'public'
-                            ? 'This dataset is publicly accessible. Click below to load credentials.'
-                            : 'Dataset files are secured in MinIO S3. Authenticate with an FDS account to acquire an S3 token.'}
-                        </p>
-                        {accessValues.error && <p className="text-destructive mb-4 text-sm bg-destructive/10 p-2 rounded border border-destructive/40">{accessValues.error}</p>}
-                        <button
-                            onClick={handleRequestAccess}
-                            className="bg-primary hover:bg-accent text-foreground font-bold py-3 px-4 rounded w-full transition-colors flex items-center justify-center gap-2 shadow-lg hover:shadow-primary/25"
-                        >
-                            <Unlock className="w-4 h-4" />
-                            {datasetData?.effective_access_level === 'public'
-                              ? 'Load Data'
-                              : status === "authenticated" ? "Request S3 Token" : "Sign In to Access"}
-                        </button>
-                    </div>
-                ) : (
-                    <div className="animate-fade-in text-sm">
-                        <div className="bg-muted border border-border text-foreground p-3 rounded mb-4 flex items-center gap-2 shadow-inner">
-                            <span className="w-2 h-2 rounded-full bg-muted animate-pulse"></span> Identity Verified
-                        </div>
-                        <div className="space-y-2 text-xs">
-                           <p className="text-muted-foreground font-medium uppercase tracking-wider">Mounted URI</p>
-                           <p className="break-all text-foreground font-mono bg-card border border-border p-2 rounded">{accessValues.s3Path}</p>
-                           <a href="#" onClick={(e) => { e.preventDefault(); setShowCodeModal(true); }} className="text-primary hover:text-foreground inline-flex items-center gap-1 mt-2">
-                               <Download className="w-3 h-3" /> Download Dataset
-                           </a>
-                        </div>
-                    </div>
-                )}
-            </div>
-
-            <div className="card p-6 bg-card/60 shadow-xl border-border">
-                <h3 className="text-lg font-bold mb-4 border-b border-border pb-2 text-foreground">Dataset Properties</h3>
-                <div className="space-y-3 text-sm">
-                    <div className="flex flex-col justify-start py-1 border-b border-border pb-2">
-                        <span className="text-muted-foreground uppercase text-xs font-bold tracking-wider mb-1">Created At</span>
-                        <span className="text-foreground">{datasetData?.created_at ? new Date(datasetData.created_at).toLocaleDateString(undefined, { year: 'numeric', month: 'long', day: 'numeric'}) : 'Unknown'}</span>
-                    </div>
-                    <div className="flex flex-col justify-start py-1 border-b border-border pb-2">
-                        <span className="text-muted-foreground uppercase text-xs font-bold tracking-wider mb-1">Media Type</span>
-                        <span className="text-foreground">{datasetData?.media_type || 'Unknown'}</span>
-                    </div>
-                    {datasetData?.license && (
-                        <div className="flex flex-col justify-start py-1 border-b border-border pb-2">
-                            <span className="text-muted-foreground uppercase text-xs font-bold tracking-wider mb-1">License</span>
-                            <span className="text-foreground">{datasetData.license}</span>
-                        </div>
-                    )}
-                     <div className="flex flex-col justify-start py-1">
-                        <span className="text-muted-foreground uppercase text-xs font-bold tracking-wider mb-1">Access Level</span>
-                        <span className="text-foreground capitalize">{datasetData?.effective_access_level || datasetData?.access_level || 'Unknown'}</span>
-                    </div>
-                </div>
-            </div>
-
-            {/* Annotations on this dataset's own axes */}
-            <ScientificMetadata properties={datasetData?.scientific_metadata} className="bg-card/60 shadow-xl border-border" />
-
-            {/* Datasets resolved for this one. The annotations are those whose
-                subject is this dataset — the shot's are resolved on the shot,
-                on its axes, and deliberately not folded in here. */}
-            {((datasetData?.geometry?.length ?? 0) > 0 || (datasetData?.calibration?.length ?? 0) > 0 || (datasetData?.annotations?.length ?? 0) > 0) && (
-                <div className="card p-6 bg-card/60 shadow-xl border-border">
-                    <h3 className="text-lg font-bold mb-4 border-b border-border pb-2 text-foreground">Related Data</h3>
-                    <div className="space-y-4 text-sm">
-                        <RelatedGroup icon={MapPin} label="Geometry" datasets={datasetData?.geometry} />
-                        <RelatedGroup
-                            icon={SlidersHorizontal}
-                            label="Calibration"
-                            hint="— applied in order"
-                            datasets={datasetData?.calibration}
-                        />
-                        <RelatedGroup
-                            icon={Highlighter}
-                            label="Annotations"
-                            hint="— on this dataset's axes"
-                            datasets={datasetData?.annotations}
-                        />
-                    </div>
-                </div>
-            )}
-
-            {/* Provenance Card */}
-            <div className="card p-6 bg-card/60 shadow-xl border-border">
-                <h3 className="text-lg font-bold mb-4 border-b border-border pb-2 text-foreground flex items-center gap-2">
-                    <Activity className="w-5 h-5 text-muted-foreground" /> Provenance
-                </h3>
-                {activityData ? (
-                    <div className="space-y-3 text-sm">
-                        {activityData.activity_type && (
-                            <div className="flex flex-col justify-start py-1 border-b border-border pb-2">
-                                <span className="text-muted-foreground uppercase text-xs font-bold tracking-wider mb-1">Activity Type</span>
-                                <span className="text-foreground">{activityData.activity_type}</span>
-                            </div>
-                        )}
-                        {activityData.source_version && (
-                            <div className="flex flex-col justify-start py-1 border-b border-border pb-2">
-                                <span className="text-muted-foreground uppercase text-xs font-bold tracking-wider mb-1">Source Version</span>
-                                <span className="font-mono text-foreground">{activityData.source_version}</span>
-                            </div>
-                        )}
-                        {activityData.started_at && (
-                            <div className="flex flex-col justify-start py-1 border-b border-border pb-2">
-                                <span className="text-muted-foreground uppercase text-xs font-bold tracking-wider mb-1">Started</span>
-                                <span className="text-foreground">{new Date(activityData.started_at).toLocaleString()}</span>
-                            </div>
-                        )}
-                        {activityData.ended_at && (
-                            <div className="flex flex-col justify-start py-1 border-b border-border pb-2">
-                                <span className="text-muted-foreground uppercase text-xs font-bold tracking-wider mb-1">Ended</span>
-                                <span className="text-foreground">{new Date(activityData.ended_at).toLocaleString()}</span>
-                            </div>
-                        )}
-                        {activityData.parameters && Object.keys(activityData.parameters).length > 0 && (
-                            <div className="flex flex-col justify-start py-1">
-                                <span className="text-muted-foreground uppercase text-xs font-bold tracking-wider mb-1">Parameters</span>
-                                <pre className="text-xs text-foreground font-mono bg-background border border-border p-2 rounded overflow-x-auto">
-                                    {JSON.stringify(activityData.parameters, null, 2)}
-                                </pre>
-                            </div>
-                        )}
-                        <Link
-                            href="/sources"
-                            className="text-xs text-primary hover:text-foreground inline-flex items-center gap-1 mt-2 transition-colors"
-                        >
-                            View Sources <ChevronRight className="w-3 h-3" />
-                        </Link>
-                    </div>
-                ) : datasetData?.activity_id ? (
-                    <p className="text-muted-foreground text-sm">Loading provenance...</p>
-                ) : (
-                    <div className="text-center py-4 bg-card/30 rounded-lg border border-dashed border-border">
-                        <p className="text-xs text-muted-foreground">No provenance recorded for this dataset.</p>
-                    </div>
-                )}
-            </div>
-
-        </div>
-
       </div>
 
-      {datasetData?.id && datasetData?.activity_id ? (
-        <div className="card p-6 mt-8 bg-card/60 shadow-xl border-border">
-          <h3 className="text-lg font-bold mb-4 border-b border-border pb-2 text-foreground flex items-center gap-2">
-            <Activity className="w-5 h-5 text-muted-foreground" /> Provenance Graph
-          </h3>
-          <ProvenanceGraph datasetId={datasetData.id} />
-        </div>
-      ) : null}
-
-      <div className="mt-10">
-        <JsonLdPanel url={`${API_BASE}/datasets/id/${id}`} />
-      </div>
     </div>
   );
 }
