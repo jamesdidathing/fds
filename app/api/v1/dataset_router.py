@@ -4,11 +4,14 @@ from fastapi import APIRouter, Query, Request, status
 from fastapi.responses import JSONResponse
 
 from app.api.deps import (
+    DEFAULT_PAGE_SIZE,
     ActivityServiceDep,
     BaseURLDep,
     CurrentUserDep,
     DatasetServiceDep,
     DistributionServiceDep,
+    Limit,
+    Offset,
     SourceServiceDep,
 )
 from app.models.activity import ActivityRead
@@ -60,24 +63,24 @@ def read_datasets_global(
     *,
     dataset_service: DatasetServiceDep,
     user: CurrentUserDep,
-    offset: int = 0,
-    limit: int = 100,
+    offset: Offset = 0,
+    limit: Limit = DEFAULT_PAGE_SIZE,
     include_storage_options: bool = False,
     include_geometry: bool = False,
     include_calibration: bool = False,
     include_annotations: bool = False,
     name: str | None = None,
-    annotation: Annotated[list[str] | None, Query()] = None,
-    shot_annotation: Annotated[list[str] | None, Query()] = None,
+    properties: Annotated[list[str] | None, Query(alias="property")] = None,
+    shot_properties: Annotated[list[str] | None, Query(alias="shot_property")] = None,
 ) -> list[DatasetRead]:
     """
     Retrieve global datasets.
 
-    `annotation` filters on the dataset's own `scientific_metadata`. Use `elm` to
-    match any dataset that carries that annotation, or `elm:type-I` to match a
+    `property` filters on the dataset's own `scientific_metadata`. Use `elm` to
+    match any dataset that carries that property, or `elm:type-I` to match a
     particular value. Repeat the parameter to require all of them.
 
-    `shot_annotation` takes the same forms but applies them to the parent shot, so
+    `shot_property` takes the same forms but applies them to the parent shot, so
     a dataset with no shot never matches it.
 
     To scope to a single device, use `/devices/{device_name}/datasets`.
@@ -87,8 +90,8 @@ def read_datasets_global(
         offset=offset,
         limit=limit,
         name=name,
-        annotations=annotation,
-        shot_annotations=shot_annotation,
+        properties=properties,
+        shot_properties=shot_properties,
     )
     return dataset_service.to_read_models(
         datasets,
@@ -155,19 +158,19 @@ def read_datasets_shot(
     shot_id: str,
     dataset_service: DatasetServiceDep,
     user: CurrentUserDep,
-    offset: int = 0,
-    limit: int = 100,
+    offset: Offset = 0,
+    limit: Limit = DEFAULT_PAGE_SIZE,
     include_storage_options: bool = False,
     include_geometry: bool = False,
     include_calibration: bool = False,
     include_annotations: bool = False,
-    annotation: Annotated[list[str] | None, Query()] = None,
+    properties: Annotated[list[str] | None, Query(alias="property")] = None,
 ) -> list[DatasetRead]:
     """
     Retrieve all datasets for a specific shot.
 
-    `annotation` filters on each dataset's own `scientific_metadata`. Use `ufo` to
-    match any dataset that carries that annotation, or `ufo:true` to match a
+    `property` filters on each dataset's own `scientific_metadata`. Use `ufo` to
+    match any dataset that carries that property, or `ufo:true` to match a
     particular value. Repeat the parameter to require all of them.
     """
     datasets = dataset_service.get_datasets_for_shot(
@@ -176,7 +179,7 @@ def read_datasets_shot(
         user=user,
         offset=offset,
         limit=limit,
-        annotations=annotation,
+        properties=properties,
     )
     return dataset_service.to_read_models(
         datasets,
@@ -256,6 +259,7 @@ def read_dataset_by_id(
             include_geometry=include_geometry,
             include_calibration=include_calibration,
             include_annotations=include_annotations,
+            user=user,
         )
         return JSONResponse(content=dcat_metadata, media_type="application/ld+json")
 
@@ -309,15 +313,15 @@ def read_datasets_device(
     dataset_service: DatasetServiceDep,
     user: CurrentUserDep,
     scope: DatasetScope = DatasetScope.ALL,
-    offset: int = 0,
-    limit: int = 100,
+    offset: Offset = 0,
+    limit: Limit = DEFAULT_PAGE_SIZE,
     include_storage_options: bool = False,
     include_geometry: bool = False,
     include_calibration: bool = False,
     include_annotations: bool = False,
     name: str | None = None,
-    annotation: Annotated[list[str] | None, Query()] = None,
-    shot_annotation: Annotated[list[str] | None, Query()] = None,
+    properties: Annotated[list[str] | None, Query(alias="property")] = None,
+    shot_properties: Annotated[list[str] | None, Query(alias="shot_property")] = None,
 ) -> list[DatasetRead]:
     """
     Retrieve datasets hosted by a device.
@@ -327,14 +331,14 @@ def read_datasets_device(
     attached to no shot (e.g., reference geometry and calibration versions), `shot`
     for those belonging to the device's shots.
 
-    `annotation` filters on each dataset's own `scientific_metadata`. Use `elm` to
-    match any dataset that carries that annotation, or `elm:type-I` to match a
+    `property` filters on each dataset's own `scientific_metadata`. Use `elm` to
+    match any dataset that carries that property, or `elm:type-I` to match a
     particular value. Repeat the parameter to require all of them.
 
-    `shot_annotation` takes the same forms but applies them to the parent shot,
-    which is what spans both levels: `?name=equilibrium&shot_annotation=elm` finds
+    `shot_property` takes the same forms but applies them to the parent shot,
+    which is what spans both levels: `?name=equilibrium&shot_property=elm` finds
     the equilibrium datasets of shots that had ELMs. Device-level datasets have no
-    shot, so `shot_annotation` matches nothing under `scope=device`.
+    shot, so `shot_property` matches nothing under `scope=device`.
     """
     datasets = dataset_service.get_datasets_for_device(
         device_name,
@@ -343,8 +347,8 @@ def read_datasets_device(
         offset=offset,
         limit=limit,
         name=name,
-        annotations=annotation,
-        shot_annotations=shot_annotation,
+        properties=properties,
+        shot_properties=shot_properties,
     )
     return dataset_service.to_read_models(
         datasets,
@@ -460,8 +464,8 @@ def read_derivations(
     dataset_id: int,
     dataset_service: DatasetServiceDep,
     user: CurrentUserDep,
-    offset: int = 0,
-    limit: int = 100,
+    offset: Offset = 0,
+    limit: Limit = DEFAULT_PAGE_SIZE,
 ) -> list[DatasetDerivationRead]:
     """
     List the upstream entities asserted for a dataset.

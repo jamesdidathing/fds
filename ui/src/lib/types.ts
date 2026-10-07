@@ -8,10 +8,9 @@ export interface Device {
 export interface Shot {
   device_name: string;
   id: string; // Changed from shot_id: number to match backend ShotRead model
-  timestamp?: string;
   shot_at?: string;
   // Wall-clock instant of the shot's relative t=0. Provider-declared; never used
-  // to convert a feature's coordinates into another frame.
+  // to convert an annotation's coordinates into another frame.
   t0_at?: string;
   description?: string;
   scientific_metadata?: ScientificProperty[];
@@ -28,7 +27,7 @@ export interface Extent {
   unit?: string | null;
 }
 
-// An entry in scientific_metadata. With an extent it is a *feature*: the same
+// An entry in scientific_metadata. With an extent it is an *annotation*: the same
 // property, localised on one axis. Without one it is a plain scalar property.
 export interface ScientificProperty {
   name: string;
@@ -36,6 +35,51 @@ export interface ScientificProperty {
   unit?: string | null;
   description?: string | null;
   extent?: Extent | null;
+  // What the value is, as the producer declared it. Absent means FDS infers it.
+  kind?: MetadataKind | null;
+}
+
+// What a scientific property's value is, as the producer declared it or as FDS
+// inferred it. It says what the value *is*, not how to draw it; the control
+// follows from the kind together with how many distinct values there are.
+export type MetadataKind = 'term' | 'quantity' | 'text';
+
+// One scientific-metadata name in scope. `values` is absent when there are too
+// many to enumerate; `distinct` is always present, so absence is never
+// ambiguous. `dimension` is set when the property carries an extent, which
+// makes it an annotation: a claim about a region of the data rather than the whole
+// record. `text` names never appear, because prose describes a record rather than
+// classifying it.
+export interface AvailableProperty {
+  name: string;
+  records: number;
+  distinct: number;
+  kind: MetadataKind;
+  unit?: string | null;
+  description?: string | null;
+  dimension?: string | null;
+  min?: number | null;
+  max?: number | null;
+  values?: string[];
+}
+
+// `total` counts the records in scope after any filter, which is the count a
+// listing page cannot give: the page is capped, the scope is not.
+export interface AvailableProperties {
+  total: number;
+  properties: AvailableProperty[];
+}
+
+// A page of one name's values, for a vocabulary too large to enumerate inline.
+export interface PropertyValue {
+  value: string;
+  records: number;
+}
+
+export interface PropertyValues {
+  name: string;
+  distinct: number;
+  values: PropertyValue[];
 }
 
 export interface Dataset {
@@ -51,6 +95,18 @@ export interface Dataset {
   description?: string;
   license?: string;
   media_type?: string;
+  creator?: string | null;
+  version?: string | null;
+  // Comma-separated, as stored.
+  keywords?: string | null;
+  temporal_start?: string | null;
+  temporal_end?: string | null;
+  quality_flag?: string | null;
+  // Registered elsewhere (a DOI, say), as an absolute URI or compact form.
+  persistent_identifier?: string | null;
+  // When the data was formally published, as a date. Not created_at, which is
+  // when FDS listed it.
+  issued?: string | null;
   access_level?: string;
   effective_access_level?: string;
   activity_id?: number;
@@ -61,7 +117,7 @@ export interface Dataset {
   calibration_stage?: number | null;
   applies_to?: Coverage;
   scientific_metadata?: ScientificProperty[];
-  // Set on a feature annotation dataset: the feature it localises. Its subject
+  // Set on an annotation dataset: the property it localises. Its subject
   // fixes the frame — subject_dataset_id, or else the shot it belongs to.
   annotates?: string | null;
   subject_dataset_id?: number | null;
@@ -71,19 +127,25 @@ export interface Dataset {
   // Resolved annotations, populated by ?include_annotations. Frame-scoped: a
   // dataset resolves only the annotations whose subject it is.
   annotations?: Dataset[];
-  // Populated by ?include_storage_options. For public data FDS fills this in
-  // without any credential exchange, which is how a dataset held in someone
-  // else's public store is opened.
-  storage_options?: StorageOptions;
+  // Every copy of the data, the default among them. url and media_type above
+  // are the default's, inlined.
+  distributions?: Distribution[] | null;
 }
 
-// fsspec/s3fs-shaped options, splat-compatible with s3fs.S3FileSystem(**opts).
-export interface StorageOptions {
-  key?: string | null;
-  secret?: string | null;
-  token?: string | null;
-  anon?: boolean | null;
-  client_kwargs?: { endpoint_url?: string; region_name?: string } | null;
+// One copy of a dataset's data. Copies are interchangeable: the same data in
+// another format or another store.
+export interface Distribution {
+  id: number;
+  url: string;
+  // The group inside the file at url that holds this dataset, when the file
+  // holds several datasets.
+  group?: string | null;
+  endpoint_url?: string | null;
+  region?: string | null;
+  media_type?: string | null;
+  format?: string | null;
+  default_distribution: boolean;
+  storage_options_type?: 'fsspec_s3' | 'icechunk_s3' | null;
 }
 
 export interface Coverage {
@@ -102,6 +164,8 @@ export interface Collection {
   access_level?: string;
   effective_access_level?: string;
   activity_id?: number | null;
+  root_url?: string | null;
+  created_at?: string;
   scientific_metadata?: ScientificProperty[];
   datasets?: Dataset[];
   child_collections?: Collection[];

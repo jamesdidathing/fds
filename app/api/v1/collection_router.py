@@ -4,15 +4,19 @@ from fastapi import APIRouter, Query, Request, status
 from fastapi.responses import JSONResponse
 
 from app.api.deps import (
+    DEFAULT_PAGE_SIZE,
     ActivityServiceDep,
     BaseURLDep,
     CollectionServiceDep,
     CurrentUserDep,
+    DatasetServiceDep,
+    Limit,
+    Offset,
 )
 from app.models.activity import ActivityRead
 from app.models.collection import CollectionCreate, CollectionRead, CollectionUpdate
+from app.models.dataset import DatasetRead
 from app.services.exceptions import ResourceNotFoundError
-from app.services.jsonld import map_collection_to_dcat
 
 router = APIRouter()
 
@@ -44,21 +48,21 @@ def read_collections_global(
     *,
     collection_service: CollectionServiceDep,
     user: CurrentUserDep,
-    offset: int = 0,
-    limit: int = 100,
+    offset: Offset = 0,
+    limit: Limit = DEFAULT_PAGE_SIZE,
     include_storage_options: bool = False,
-    annotation: Annotated[list[str] | None, Query()] = None,
+    properties: Annotated[list[str] | None, Query(alias="property")] = None,
 ) -> list[CollectionRead]:
     """Retrieve all global Collections accessible to the current user.
 
-    `annotation` filters on the Collection's own `scientific_metadata`. Use `elm`
-    to match any collection that carries that annotation, or `elm:type-I` to match
+    `property` filters on the Collection's own `scientific_metadata`. Use `elm`
+    to match any collection that carries that property, or `elm:type-I` to match
     a particular value. Repeat it with a *different* name to require both:
-    `?annotation=disruption&annotation=elm` matches only collections carrying
+    `?property=disruption&property=elm` matches only collections carrying
     each.
     """
     collections = collection_service.get_multi(
-        user=user, offset=offset, limit=limit, annotations=annotation
+        user=user, offset=offset, limit=limit, properties=properties
     )
     return collection_service.to_read_models(collections, include_storage_options, user)
 
@@ -91,7 +95,7 @@ def read_collection_by_id(
     collection_service.check_read_access(collection, user)
 
     if "application/ld+json" in request.headers.get("accept", ""):
-        dcat_metadata = map_collection_to_dcat(collection, base)
+        dcat_metadata = collection_service.to_dcat(collection, base, user)
         return JSONResponse(content=dcat_metadata, media_type="application/ld+json")
     return collection_service.to_read_model(collection, include_storage_options, user)
 
@@ -119,7 +123,7 @@ def read_collection_global_by_name(
         name=name, user=user
     )
     if "application/ld+json" in request.headers.get("accept", ""):
-        dcat_metadata = map_collection_to_dcat(collection, base)
+        dcat_metadata = collection_service.to_dcat(collection, base, user)
         return JSONResponse(content=dcat_metadata, media_type="application/ld+json")
     return collection_service.to_read_model(collection, include_storage_options, user)
 
@@ -154,21 +158,21 @@ def read_collections_device(
     device_name: str,
     collection_service: CollectionServiceDep,
     user: CurrentUserDep,
-    offset: int = 0,
-    limit: int = 100,
+    offset: Offset = 0,
+    limit: Limit = DEFAULT_PAGE_SIZE,
     include_storage_options: bool = False,
-    annotation: Annotated[list[str] | None, Query()] = None,
+    properties: Annotated[list[str] | None, Query(alias="property")] = None,
 ) -> list[CollectionRead]:
     """Retrieve all device-level Collections accessible to the current user.
 
-    `annotation` filters on the Collection's own `scientific_metadata`. Use `elm`
-    to match any collection that carries that annotation, or `elm:type-I` to match
+    `property` filters on the Collection's own `scientific_metadata`. Use `elm`
+    to match any collection that carries that property, or `elm:type-I` to match
     a particular value. Repeat it with a *different* name to require both:
-    `?annotation=disruption&annotation=elm` matches only collections carrying
+    `?property=disruption&property=elm` matches only collections carrying
     each.
     """
     collections = collection_service.get_collections_for_device(
-        device_name, user=user, offset=offset, limit=limit, annotations=annotation
+        device_name, user=user, offset=offset, limit=limit, properties=properties
     )
     return collection_service.to_read_models(collections, include_storage_options, user)
 
@@ -197,7 +201,7 @@ def read_collection_device_by_name(
         name=name, user=user, device_name=device_name
     )
     if "application/ld+json" in request.headers.get("accept", ""):
-        dcat_metadata = map_collection_to_dcat(collection, base)
+        dcat_metadata = collection_service.to_dcat(collection, base, user)
         return JSONResponse(content=dcat_metadata, media_type="application/ld+json")
     return collection_service.to_read_model(collection, include_storage_options, user)
 
@@ -235,17 +239,17 @@ def read_collections_shot(
     shot_id: str,
     collection_service: CollectionServiceDep,
     user: CurrentUserDep,
-    offset: int = 0,
-    limit: int = 100,
+    offset: Offset = 0,
+    limit: Limit = DEFAULT_PAGE_SIZE,
     include_storage_options: bool = False,
-    annotation: Annotated[list[str] | None, Query()] = None,
+    properties: Annotated[list[str] | None, Query(alias="property")] = None,
 ) -> list[CollectionRead]:
     """Retrieve all Collections scoped to a specific shot.
 
-    `annotation` filters on the Collection's own `scientific_metadata`. Use `elm`
-    to match any collection that carries that annotation, or `elm:type-I` to match
+    `property` filters on the Collection's own `scientific_metadata`. Use `elm`
+    to match any collection that carries that property, or `elm:type-I` to match
     a particular value. Repeat it with a *different* name to require both:
-    `?annotation=disruption&annotation=elm` matches only collections carrying
+    `?property=disruption&property=elm` matches only collections carrying
     each.
     """
     collections = collection_service.get_collections_for_shot(
@@ -254,7 +258,7 @@ def read_collections_shot(
         user=user,
         offset=offset,
         limit=limit,
-        annotations=annotation,
+        properties=properties,
     )
     return collection_service.to_read_models(collections, include_storage_options, user)
 
@@ -284,7 +288,7 @@ def read_collection_shot_by_name(
         name=name, user=user, device_name=device_name, shot_id=shot_id
     )
     if "application/ld+json" in request.headers.get("accept", ""):
-        dcat_metadata = map_collection_to_dcat(collection, base)
+        dcat_metadata = collection_service.to_dcat(collection, base, user)
         return JSONResponse(content=dcat_metadata, media_type="application/ld+json")
     return collection_service.to_read_model(collection, include_storage_options, user)
 
@@ -318,6 +322,60 @@ def delete_collection(
 ) -> None:
     """Delete a Collection by internal ID. Requires appropriate tiered authorisation."""
     collection_service.delete(id, user)
+
+
+@router.get(
+    "/collections/{collection_id}/datasets",
+    response_model=list[DatasetRead],
+    response_model_exclude_none=True,
+)
+def read_collection_datasets(
+    *,
+    collection_id: int,
+    collection_service: CollectionServiceDep,
+    dataset_service: DatasetServiceDep,
+    user: CurrentUserDep,
+    offset: Offset = 0,
+    limit: Limit = DEFAULT_PAGE_SIZE,
+    include_storage_options: bool = False,
+) -> list[DatasetRead]:
+    """Page through a Collection's member Datasets, ordered by id.
+
+    A collection read inlines only the first page; this returns the rest. A page
+    shorter than `limit` is the last.
+    """
+    collection_service.get_readable_or_raise(collection_id, user)
+    datasets = collection_service.get_member_datasets(
+        collection_id, user, offset=offset, limit=limit
+    )
+    return dataset_service.to_read_models(
+        datasets, include_storage_options=include_storage_options, user=user
+    )
+
+
+@router.get(
+    "/collections/{collection_id}/collections",
+    response_model=list[CollectionRead],
+    response_model_exclude_none=True,
+)
+def read_child_collections(
+    *,
+    collection_id: int,
+    collection_service: CollectionServiceDep,
+    user: CurrentUserDep,
+    offset: Offset = 0,
+    limit: Limit = DEFAULT_PAGE_SIZE,
+) -> list[CollectionRead]:
+    """Page through the Collections nested directly in a Collection, ordered by id.
+
+    Each child is returned without its own members; read it to get those. A page
+    shorter than `limit` is the last.
+    """
+    collection_service.get_readable_or_raise(collection_id, user)
+    children = collection_service.get_child_collections(
+        collection_id, user, offset=offset, limit=limit
+    )
+    return collection_service.to_summary_read_models(children)
 
 
 @router.post(

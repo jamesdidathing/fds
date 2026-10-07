@@ -1,4 +1,5 @@
-from datetime import timedelta
+from collections.abc import Sequence
+from datetime import date, timedelta
 from typing import TYPE_CHECKING, Any
 
 from app.models.activity import AgentRole
@@ -53,12 +54,15 @@ METADATA_CONTEXT = {
     "time": "http://www.w3.org/2006/time#",
     "xsd": "http://www.w3.org/2001/XMLSchema#",
     "dqv": "http://www.w3.org/ns/dqv#",
+    "foaf": "http://xmlns.com/foaf/0.1/",
     "oa": "http://www.w3.org/ns/oa#",
+    "adms": "http://www.w3.org/ns/adms#",
+    "skos": "http://www.w3.org/2004/02/skos/core#",
     "title": "dct:title",
     "description": "dct:description",
     "publisher": "dct:publisher",
     "identifier": "dct:identifier",
-    "created": {"@id": "dct:created", "@type": "xsd:dateTime"},
+    "issued": {"@id": "dct:issued", "@type": "xsd:dateTime"},
     "modified": {"@id": "dct:modified", "@type": "xsd:dateTime"},
     "creator": "dct:creator",
     "startDate": {"@id": "dcat:startDate", "@type": "xsd:dateTime"},
@@ -93,20 +97,27 @@ def _build_used(activity: "Activity", base_url: str) -> tuple[list[Any], list[An
     entity references; ``qualified_usage`` carries the role on each.
     """
     names = Identifiers(base_url)
-    entries: list[tuple[str, str]] = []  # (entity @id, FuEL role concept)
+    # (entity @id, FuEL role concept, title). The title saves a reader fetching
+    # each entity's own document just to name it.
+    entries: list[tuple[str, str, str]] = []
     for ds in getattr(activity, "input_datasets", None) or []:
-        entries.append((names.dataset(ds.id), FUEL_INPUT_ROLE))
+        entries.append((names.dataset(ds.id), FUEL_INPUT_ROLE, ds.title or ds.name))
     for instrument in getattr(activity, "instruments", None) or []:
-        entries.append((names.source(instrument.id), FUEL_INSTRUMENT_ROLE))
+        entries.append(
+            (names.source(instrument.id), FUEL_INSTRUMENT_ROLE, instrument.name)
+        )
 
-    used = [{"@id": uri, "@type": "prov:Entity"} for uri, _ in entries]
+    used = [
+        {"@id": uri, "@type": "prov:Entity", "dct:title": title}
+        for uri, _, title in entries
+    ]
     qualified_usage = [
         {
             "@type": "prov:Usage",
-            "prov:entity": {"@id": uri, "@type": "prov:Entity"},
+            "prov:entity": {"@id": uri, "@type": "prov:Entity", "dct:title": title},
             "prov:hadRole": {"@id": role},
         }
-        for uri, role in entries
+        for uri, role, title in entries
     ]
     return used, qualified_usage
 
@@ -114,7 +125,6 @@ def _build_used(activity: "Activity", base_url: str) -> tuple[list[Any], list[An
 def _agent_node(
     source: "Source",
     base_url: str,
-    version: str | None = None,
     acted_on_behalf_of: list[str] | None = None,
 ) -> dict[str, Any]:
     """Build a PROV-O agent node for a Source, typed by its kind.
@@ -130,10 +140,31 @@ def _agent_node(
         "dct:title": source.name,
         "dct:description": source.description,
     }
-    if version:
-        node["dcat:version"] = version
+    if source.persistent_identifier:
+        node["adms:identifier"] = _persistent_identifier_node(
+            source.persistent_identifier
+        )
     if acted_on_behalf_of:
         node["prov:actedOnBehalfOf"] = [{"@id": uri} for uri in acted_on_behalf_of]
+    return {k: v for k, v in node.items() if v is not None}
+
+
+def _instrument_node(source: "Source", base_url: str) -> dict[str, Any]:
+    """An instrument Source as the ``prov:Entity`` an activity uses.
+
+    It measures but does not act, so it is not an agent.
+    """
+    names = Identifiers(base_url)
+    node: dict[str, Any] = {
+        "@id": names.source(source.id),
+        "@type": "prov:Entity",
+        "dct:title": source.name,
+        "dct:description": source.description,
+    }
+    if source.persistent_identifier:
+        node["adms:identifier"] = _persistent_identifier_node(
+            source.persistent_identifier
+        )
     return {k: v for k, v in node.items() if v is not None}
 
 
@@ -160,16 +191,22 @@ def _build_associations(
         primary = _agent_node(
             executor,
             base_url,
-            activity.source_version,
             acted_on_behalf_of=behalf.get(executor.id) if executor.id else None,
         )
-        qualified.append(
-            {
-                "@type": "prov:Association",
-                "prov:agent": {"@id": primary["@id"]},
-                "prov:hadRole": {"@id": FUEL_EXECUTOR_ROLE},
+        association: dict[str, Any] = {
+            "@type": "prov:Association",
+            "prov:agent": {"@id": primary["@id"]},
+            "prov:hadRole": {"@id": FUEL_EXECUTOR_ROLE},
+        }
+        # The version this run used is the plan the executor followed, so it
+        # belongs to this association, not to the Source every run shares. A
+        # blank node: nothing is stored per version.
+        if activity.source_version:
+            association["prov:hadPlan"] = {
+                "@type": "prov:Plan",
+                "dcat:version": activity.source_version,
             }
-        )
+        qualified.append(association)
 
     for link in getattr(activity, "agent_links", None) or []:
         agent = getattr(link, "source", None)
@@ -261,6 +298,40 @@ def _as_uri(identifier: str) -> str | None:
     if candidate.startswith("10."):
         return f"https://doi.org/{candidate}"
     return None
+
+
+def _persistent_identifier_node(identifier: str) -> dict[str, Any]:
+    """A registered persistent identifier as an ``adms:Identifier``.
+
+    ``dct:identifier`` stays the record's FDS identifier, as DCAT-AP has it. The
+    value is a full URI where its scheme has a canonical resolver, and as given
+    otherwise rather than a guessed link.
+    """
+    uri = _as_uri(identifier)
+    notation: str | dict[str, str] = (
+        {"@value": uri, "@type": "xsd:anyURI"} if uri else identifier
+    )
+    return {"@type": "adms:Identifier", "skos:notation": notation}
+
+
+def _issued_node(issued: date) -> dict[str, str]:
+    """When the resource itself was published, as ``dct:issued``.
+
+    Typed as a date, unlike the catalogue record's ``issued``, which is when FDS
+    listed it.
+    """
+    return {"@value": issued.isoformat(), "@type": "xsd:date"}
+
+
+def _generated_at(activity: "Activity") -> dict[str, str] | None:
+    """When the resource was generated: the end of the activity that produced it.
+
+    Stated on the resource itself so a reader need not open the activity, and
+    derived rather than stored so the two cannot disagree.
+    """
+    if not activity.ended_at:
+        return None
+    return {"@value": activity.ended_at.isoformat(), "@type": "xsd:dateTime"}
 
 
 def _map_scientific_metadata_to_jsonld(metadata: list[Any]) -> list[dict[str, Any]]:
@@ -380,15 +451,44 @@ def _numeric_range_node(
     return node
 
 
+def _with_catalog_record(node: dict[str, Any], entry: Any) -> dict[str, Any]:
+    """Return ``node`` and FDS's record of it as one document.
+
+    ``created_at`` and ``updated_at`` say when FDS listed the resource and last
+    changed its entry, not when the resource was made or changed. They belong to
+    a ``dcat:CatalogRecord`` about the resource rather than to the resource.
+    """
+    resource = {k: v for k, v in node.items() if k != "@context"}
+    if "@id" not in resource:
+        return node
+    created_at = getattr(entry, "created_at", None)
+    updated_at = getattr(entry, "updated_at", None)
+    record = {
+        "@id": f"{resource['@id']}#record",
+        "@type": "dcat:CatalogRecord",
+        "foaf:primaryTopic": {"@id": resource["@id"]},
+        "issued": created_at.isoformat() if created_at else None,
+        "modified": updated_at.isoformat() if updated_at else None,
+    }
+    return {
+        "@context": METADATA_CONTEXT,
+        "@graph": [resource, {k: v for k, v in record.items() if v is not None}],
+    }
+
+
 def map_device_to_dcat(device: Device | DeviceRead, base_url: str) -> dict[str, Any]:
-    """
-    Maps a Device to a dcat:Catalog.
-    """
+    """Maps a Device to a ``dcat:Catalog`` document with FDS's record of it."""
+    return _with_catalog_record(
+        {"@context": METADATA_CONTEXT, **device_node(device, base_url)}, device
+    )
+
+
+def device_node(device: Device | DeviceRead, base_url: str) -> dict[str, Any]:
+    """The Device's ``dcat:Catalog`` node alone, for embedding in another document."""
     names = Identifiers(base_url)
     device_uri = names.device(device.name)
 
     data = {
-        "@context": METADATA_CONTEXT,
         "@type": "dcat:Catalog",
         "@id": device_uri,
         "title": device.title or f"Device: {device.name}",
@@ -396,13 +496,11 @@ def map_device_to_dcat(device: Device | DeviceRead, base_url: str) -> dict[str, 
         "identifier": device.name,
         "publisher": device.publisher,
         "creator": device.creator,
-        "created": device.created_at.isoformat()
-        if hasattr(device, "created_at")
-        else None,
-        "modified": device.updated_at.isoformat()
-        if hasattr(device, "updated_at")
-        else None,
     }
+    if device.persistent_identifier:
+        data["adms:identifier"] = _persistent_identifier_node(
+            device.persistent_identifier
+        )
 
     return {k: v for k, v in data.items() if v is not None}
 
@@ -437,11 +535,13 @@ def map_shot_to_dcat(
         "identifier": shot.id,
         "publisher": shot.publisher,
         "creator": shot.creator,
-        "created": shot.created_at.isoformat() if hasattr(shot, "created_at") else None,
-        "modified": shot.updated_at.isoformat()
-        if hasattr(shot, "updated_at")
-        else None,
     }
+    if shot.persistent_identifier:
+        data["adms:identifier"] = _persistent_identifier_node(
+            shot.persistent_identifier
+        )
+    if shot.issued:
+        data["dct:issued"] = _issued_node(shot.issued)
     # dct:temporal → dct:PeriodOfTime. Emit a closed period when an end is known or
     # derivable from the duration; otherwise an open period (start only).
     if shot.shot_at:
@@ -468,7 +568,7 @@ def map_shot_to_dcat(
             _qualified_relation(version, FUEL_ANNOTATION_ROLE, base_url)
             for version in resolved_annotations
         ]
-    return {k: v for k, v in data.items() if v is not None}
+    return _with_catalog_record({k: v for k, v in data.items() if v is not None}, shot)
 
 
 def map_dataset_to_dcat(
@@ -500,16 +600,17 @@ def map_dataset_to_dcat(
         "identifier": str(dataset.id) if hasattr(dataset, "id") else dataset.name,
         "publisher": dataset.publisher,
         "creator": dataset.creator,
-        "created": dataset.created_at.isoformat()
-        if hasattr(dataset, "created_at")
-        else None,
-        "modified": dataset.updated_at.isoformat()
-        if hasattr(dataset, "updated_at")
-        else None,
         "keywords": dataset.keywords.split(",") if dataset.keywords else [],
         "license": dataset.license,
         "version": dataset.version,
     }
+
+    if dataset.persistent_identifier:
+        data["adms:identifier"] = _persistent_identifier_node(
+            dataset.persistent_identifier
+        )
+    if dataset.issued:
+        data["dct:issued"] = _issued_node(dataset.issued)
 
     if dataset.access_level:
         data["accessRights"] = dataset.access_level.value
@@ -562,6 +663,7 @@ def map_dataset_to_dcat(
     activity: Activity | None = getattr(dataset, "activity", None)
     if activity:
         data["prov:wasGeneratedBy"] = _build_activity_node(activity, base_url)
+        data["prov:generatedAtTime"] = _generated_at(activity)
 
     derivations = getattr(dataset, "derivations", None) or []
     if derivations:
@@ -616,17 +718,24 @@ def map_dataset_to_dcat(
     if qualified_relations:
         data["dcat:qualifiedRelation"] = qualified_relations
 
-    return {k: v for k, v in data.items() if v is not None}
+    return _with_catalog_record(
+        {k: v for k, v in data.items() if v is not None}, dataset
+    )
 
 
 def map_source_to_dcat(source: "Source", base_url: str) -> dict[str, Any]:
-    """A Source as a standalone PROV-O agent document.
+    """A Source as a standalone PROV-O document.
 
     The same node that is embedded in the provenance of anything this Source
-    produced, given a context so that the identifier FDS publishes for it
-    resolves to a description rather than to nothing.
+    produced or measured, given a context so that the identifier FDS publishes
+    for it resolves to a description rather than to nothing.
     """
-    return {"@context": METADATA_CONTEXT, **_agent_node(source, base_url)}
+    node = (
+        _instrument_node(source, base_url)
+        if source.kind is SourceKind.INSTRUMENT
+        else _agent_node(source, base_url)
+    )
+    return {"@context": METADATA_CONTEXT, **node}
 
 
 def map_activity_to_dcat(activity: "Activity", base_url: str) -> dict[str, Any]:
@@ -649,6 +758,8 @@ def _build_activity_node(activity: "Activity", base_url: str) -> dict[str, Any]:
         "@type": "prov:Activity",
         "prov:type": activity.activity_type,
     }
+    if activity.id:
+        prov_node["@id"] = Identifiers(base_url).activity(activity.id)
     primary, qualified = _build_associations(activity, base_url)
     if primary:
         prov_node["prov:wasAssociatedWith"] = primary
@@ -718,7 +829,11 @@ def _coverage_to_period(coverage: Any) -> dict[str, Any] | None:
 
 
 def map_collection_to_dcat(
-    collection: Collection | CollectionRead, base_url: str
+    collection: Collection | CollectionRead,
+    base_url: str,
+    *,
+    datasets: Sequence[Dataset],
+    child_collections: Sequence[Collection],
 ) -> dict[str, Any]:
     """Maps a Collection to a JSON-LD document typed as both ``dcat:Catalog``
     and ``prov:Collection``.
@@ -743,13 +858,13 @@ def map_collection_to_dcat(
         "identifier": str(collection_id) if collection_id else collection.name,
         "publisher": collection.publisher,
         "creator": collection.creator,
-        "created": collection.created_at.isoformat()
-        if hasattr(collection, "created_at")
-        else None,
-        "modified": collection.updated_at.isoformat()
-        if hasattr(collection, "updated_at")
-        else None,
     }
+    if collection.persistent_identifier:
+        data["adms:identifier"] = _persistent_identifier_node(
+            collection.persistent_identifier
+        )
+    if collection.issued:
+        data["dct:issued"] = _issued_node(collection.issued)
 
     if collection.access_level:
         data["accessRights"] = collection.access_level.value
@@ -773,21 +888,19 @@ def map_collection_to_dcat(
     # references and, in PROV terms, collected via prov:hadMember below.
     member_ids: list[str] = []
 
-    member_datasets: list[Any] = getattr(collection, "datasets", []) or []
     dataset_refs = [
         {
             "@id": names.dataset(ds.id),
             "@type": "dcat:Dataset",
             "dct:title": ds.title or ds.name,
         }
-        for ds in member_datasets
-        if getattr(ds, "id", None)
+        for ds in datasets
+        if ds.id
     ]
     if dataset_refs:
         data["dcat:dataset"] = dataset_refs
         member_ids.extend(ref["@id"] for ref in dataset_refs)
 
-    child_collections: list[Any] = getattr(collection, "child_collections", []) or []
     catalog_refs = [
         {
             "@id": names.collection(c.id),
@@ -795,7 +908,7 @@ def map_collection_to_dcat(
             "dct:title": c.title or c.name,
         }
         for c in child_collections
-        if getattr(c, "id", None)
+        if c.id
     ]
     if catalog_refs:
         data["dcat:catalog"] = catalog_refs
@@ -809,5 +922,8 @@ def map_collection_to_dcat(
     activity: Activity | None = getattr(collection, "activity", None)
     if activity:
         data["prov:wasGeneratedBy"] = _build_activity_node(activity, base_url)
+        data["prov:generatedAtTime"] = _generated_at(activity)
 
-    return {k: v for k, v in data.items() if v is not None}
+    return _with_catalog_record(
+        {k: v for k, v in data.items() if v is not None}, collection
+    )

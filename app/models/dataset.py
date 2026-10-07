@@ -1,4 +1,4 @@
-from datetime import datetime
+from datetime import date
 from enum import Enum
 from typing import TYPE_CHECKING, Self
 
@@ -14,8 +14,16 @@ from sqlmodel import (
     text,
 )
 
+from app.core.timeutils import UTCDatetime
+
 from .coverage import Coverage
-from .mixins import DescriptiveMixin, ScientificMetadataMixin, TimestampMixin
+from .mixins import (
+    DescriptiveMixin,
+    IssuedMixin,
+    PersistentIdentifierMixin,
+    ScientificMetadataMixin,
+    TimestampMixin,
+)
 from .policy import AccessLevel
 from .scientific_metadata import ScientificProperty
 from .storage_options import StorageOptions, StorageOptionsType
@@ -40,7 +48,13 @@ class DatasetScope(str, Enum):
     SHOT = "shot"
 
 
-class DatasetBase(DescriptiveMixin, ScientificMetadataMixin, TimestampMixin, SQLModel):
+class DatasetBase(
+    DescriptiveMixin,
+    ScientificMetadataMixin,
+    PersistentIdentifierMixin,
+    IssuedMixin,
+    SQLModel,
+):
     """Core metadata for a dataset (maps to ``dcat:Dataset``).
 
     A Dataset is a metadata container describing *what* the data is.  The
@@ -72,8 +86,8 @@ class DatasetBase(DescriptiveMixin, ScientificMetadataMixin, TimestampMixin, SQL
     name: str = Field(index=True)
     level: int | None = Field(default=None, index=True)
     quality_flag: str | None = Field(default=None, index=True)
-    temporal_start: datetime | None = Field(default=None)
-    temporal_end: datetime | None = Field(default=None)
+    temporal_start: UTCDatetime | None = Field(default=None)
+    temporal_end: UTCDatetime | None = Field(default=None)
     device_name: str | None = Field(default=None, index=True)
     access_level: AccessLevel | None = Field(default=None, index=True)
     license: str | None = Field(default=None)
@@ -155,7 +169,7 @@ class DatasetBase(DescriptiveMixin, ScientificMetadataMixin, TimestampMixin, SQL
         default=None,
         index=True,
         description=(
-            "For a feature annotation dataset: the feature it localises (e.g. 'elm'). "
+            "For an annotation dataset: the property it localises (e.g. 'elm'). "
             "Marks the dataset as an annotation and matches the inline annotation of the "
             "same name on its subject. "
             "The subject fixes the frame: subject_dataset_id (dataset frame) or the "
@@ -165,7 +179,7 @@ class DatasetBase(DescriptiveMixin, ScientificMetadataMixin, TimestampMixin, SQL
     )
 
 
-class Dataset(DatasetBase, table=True):
+class Dataset(DatasetBase, TimestampMixin, table=True):
     __table_args__ = (
         ForeignKeyConstraint(
             ["device_name", "shot_id"],
@@ -212,8 +226,8 @@ class Dataset(DatasetBase, table=True):
         foreign_key="dataset.id",
         index=True,
         description=(
-            "For a feature annotation linked to a specific Dataset: the source Dataset "
-            "this annotation localises a feature in. Null for a shot-frame "
+            "For an annotation linked to a specific Dataset: the source Dataset "
+            "this annotation localises a property in. Null for a shot-frame "
             "annotation, whose subject is the shot it belongs to."
         ),
     )
@@ -347,6 +361,7 @@ class DatasetCreate(DatasetBase):
     # Default distribution fields — passed through to a Distribution row with
     # default_distribution=True on create.  Only created when url is supplied.
     url: str | None = None
+    group: str | None = None
     endpoint_url: str | None = None
     region: str | None = None
     media_type: str | None = None
@@ -355,10 +370,10 @@ class DatasetCreate(DatasetBase):
     derived_from: list[DatasetDerivationCreate] = Field(default_factory=list)
 
 
-class DatasetRead(DatasetBase):
+class DatasetRead(DatasetBase, TimestampMixin):
     """Dataset response schema.
 
-    ``url``, ``media_type``, ``format``, and ``storage_options`` are
+    ``url``, ``group``, ``media_type``, ``format``, and ``storage_options`` are
     denormalised from the default distribution for convenience.
     ``distributions`` lists all distributions associated with the dataset,
     including the default one (identified by ``default_distribution=True``).
@@ -374,6 +389,7 @@ class DatasetRead(DatasetBase):
     effective_access_level: AccessLevel | None = None
     # Default distribution fields inlined for convenience (None when no distribution exists)
     url: str | None = None
+    group: str | None = None
     media_type: str | None = None
     format: str | None = None
     storage_options: StorageOptions | None = None
@@ -386,10 +402,12 @@ class DatasetRead(DatasetBase):
 
 class DatasetUpdate(SQLModel):
     name: str | None = None
+    persistent_identifier: str | None = None
+    issued: date | None = None
     level: int | None = None
     quality_flag: str | None = None
-    temporal_start: datetime | None = None
-    temporal_end: datetime | None = None
+    temporal_start: UTCDatetime | None = None
+    temporal_end: UTCDatetime | None = None
     device_name: str | None = None
     shot_id: str | None = None
     activity_id: int | None = None

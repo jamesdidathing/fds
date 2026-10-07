@@ -1,5 +1,5 @@
 from collections import defaultdict
-from urllib.parse import urlparse
+from typing import NamedTuple
 
 import structlog
 from sqlmodel import Session, col, select
@@ -18,12 +18,32 @@ from app.models.file_access import (
     CredentialManifest,
     CredentialPayload,
     CredentialRequest,
+    S3Credentials,
 )
 from app.models.identity import AuthenticatedUser
 from app.models.policy import AccessLevel
+from app.models.storage_options import (
+    StorageBackend,
+    StorageOptionsType,
+    parse_storage_url,
+)
 from app.services.exceptions import ForbiddenError
 
 logger = structlog.get_logger(__name__)
+
+
+class ResolvedDistribution(NamedTuple):
+    """A distribution URL the caller may read, with what vending needs.
+
+    ``storage_options_type`` and ``region`` come straight off the Distribution
+    row, so rendering opener-ready options needs no second query and no second
+    guess at the media type.
+    """
+
+    url: str
+    endpoint_url: str | None
+    storage_options_type: StorageOptionsType | None
+    region: str | None
 
 
 class FileAccessService:
@@ -33,54 +53,91 @@ class FileAccessService:
         self.session = session
 
     def generate_session_credentials(
-        self, user: AuthenticatedUser, request: CredentialRequest
+        self,
+        user: AuthenticatedUser,
+        request: CredentialRequest,
+        include_storage_options: bool = False,
     ) -> CredentialManifest:
         """
         Generates temporary storage credentials.
         Returns a manifest mapping each dataset URL to its credential.
-        """
-        allowed_pairs = self._resolve_allowed_urls(user, request)
 
-        if not allowed_pairs:
+        With ``include_storage_options`` each entry also carries an
+        opener-ready ``storage_options`` rendering, in the shape the URL's own
+        Distribution declares, so a worker can splat it into
+        ``xr.open_dataset`` or ``icechunk.s3_storage`` without hand-mapping.
+        """
+        resolved = self._resolve_allowed_urls(user, request)
+
+        if not resolved:
             logger.info("credentials.none_permitted")
             return CredentialManifest(resource_map={})
 
-        grouped = self._group_by_endpoint(allowed_pairs)
+        grouped = self._group_by_endpoint(resolved)
         session_name = f"fds-sess-{user.id[-8:]}"
         resource_map: dict[str, CredentialPayload] = {}
 
-        for (protocol, endpoint_url), urls in grouped.items():
-            if not urls:
-                continue
+        for (backend, endpoint_url), urls in grouped.items():
             resource_map.update(
-                self._mint_for_protocol(protocol, endpoint_url, urls, session_name)
+                self._mint_for_backend(backend, endpoint_url, urls, session_name)
             )
+
+        if include_storage_options:
+            by_url = {r.url: r for r in resolved}
+            resource_map = {
+                url: self._render_storage_options(credential, by_url[url])
+                for url, credential in resource_map.items()
+            }
 
         return CredentialManifest(resource_map=resource_map)
 
+    @staticmethod
+    def _render_storage_options(
+        credential: CredentialPayload, resolved: ResolvedDistribution
+    ) -> CredentialPayload:
+        """Return a copy of ``credential`` carrying its opener-ready rendering.
+
+        A copy, not a mutation: the S3 provider hands the same credential
+        object back for every bucket in a chunk, and two URLs on that chunk can
+        want different shapes or regions.
+        """
+        if isinstance(credential, S3Credentials):
+            if resolved.storage_options_type is None:
+                # The Distribution opted out of generated storage options
+                # (plain HTTPS download, MDSplus reference, and so on).
+                return credential
+            options = credential.to_storage_options(
+                resolved.storage_options_type, region=resolved.region
+            )
+        else:
+            # Azure and GCS render one shape each, with no target type to pick.
+            options = credential.to_storage_options()
+        return credential.model_copy(update={"storage_options": options})
+
     def _group_by_endpoint(
-        self, url_pairs: list[tuple[str, str | None]]
-    ) -> dict[tuple[str, str | None], list[str]]:
-        logger.debug("credentials.grouping_urls", url_count=len(url_pairs))
-        grouped: dict[tuple[str, str | None], list[str]] = defaultdict(list)
-        for url, endpoint_url in url_pairs:
-            parsed = urlparse(url)
-            protocol = parsed.scheme
-            if protocol:
-                grouped[(protocol, endpoint_url)].append(url)
+        self, resolved: list[ResolvedDistribution]
+    ) -> dict[tuple[StorageBackend, str | None], list[str]]:
+        logger.debug("credentials.grouping_urls", url_count=len(resolved))
+        grouped: dict[tuple[StorageBackend, str | None], list[str]] = defaultdict(list)
+        for entry in resolved:
+            location = parse_storage_url(entry.url)
+            if location:
+                grouped[(location.backend, entry.endpoint_url)].append(entry.url)
         return grouped
 
-    def _mint_for_protocol(
+    def _mint_for_backend(
         self,
-        protocol: str,
+        backend: StorageBackend,
         endpoint_url: str | None,
         urls: list[str],
         session_name: str,
     ) -> dict[str, CredentialPayload]:
         result: dict[str, CredentialPayload] = {}
-        provider = get_provider_for_endpoint(endpoint_url)
+        provider = get_provider_for_endpoint(backend, endpoint_url)
         if provider is None:
-            logger.warning("credentials.no_provider", endpoint_url=endpoint_url)
+            logger.warning(
+                "credentials.no_provider", backend=backend, endpoint_url=endpoint_url
+            )
             return {}
 
         chunks = [
@@ -91,29 +148,24 @@ class FileAccessService:
         for chunk_index, chunk in enumerate(chunks):
             logger.info(
                 "credentials.vending",
-                protocol=protocol,
+                backend=backend,
                 endpoint_url=endpoint_url,
                 chunk_size=len(chunk),
                 chunk_index=chunk_index,
             )
 
-            creds = provider.generate_credentials(
-                chunk, f"{session_name}-{chunk_index}"
+            result.update(
+                provider.generate_credentials(chunk, f"{session_name}-{chunk_index}")
             )
-
-            for url in chunk:
-                bucket = urlparse(url).netloc
-                if bucket in creds:
-                    result[url] = creds[bucket]
 
         return result
 
     def _resolve_allowed_urls(
         self, user: AuthenticatedUser, request: CredentialRequest
-    ) -> list[tuple[str, str | None]]:
+    ) -> list[ResolvedDistribution]:
         """
         Queries the database to find allowed distribution URLs based on request filter.
-        Returns (url, endpoint_url) pairs for each permitted distribution.
+        Returns one :class:`ResolvedDistribution` per permitted distribution.
         """
         # Guard: If no filters are provided, return empty list to avoid selecting *all* datasets.
         if not request.shot_id and not request.device_name and not request.data_urls:
@@ -146,10 +198,15 @@ class FileAccessService:
             data_urls=request.data_urls,
         )
 
-        seen: dict[str, str | None] = {}
+        seen: dict[str, ResolvedDistribution] = {}
         for ds, dist in rows:
             if self._check_download_permission(user, ds):
-                seen[dist.url] = dist.endpoint_url
+                seen[dist.url] = ResolvedDistribution(
+                    url=dist.url,
+                    endpoint_url=dist.endpoint_url,
+                    storage_options_type=dist.storage_options_type,
+                    region=dist.region,
+                )
                 record_data_access(
                     ds.id,
                     dist.url,
@@ -157,7 +214,7 @@ class FileAccessService:
                     get_effective_access_level(ds, self.session),
                 )
 
-        return list(seen.items())
+        return list(seen.values())
 
     def _check_download_permission(
         self, user: AuthenticatedUser, dataset: Dataset

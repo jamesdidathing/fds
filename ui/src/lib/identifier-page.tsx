@@ -37,9 +37,22 @@ export async function fetchJsonLd(path: string): Promise<JsonLd | null> {
   return response ? ((await response.json()) as JsonLd) : null;
 }
 
+/**
+ * The node a document is about. Devices, shots, datasets and collections come
+ * as an `@graph` holding the resource and FDS's catalogue record of it; sources
+ * and activities are a single node.
+ */
+function resourceNode(document: JsonLd | null): JsonLd | null {
+  const graph = document?.['@graph'];
+  if (!Array.isArray(graph)) return document;
+  const node = graph.find((n: JsonLd) => n['@type'] !== 'dcat:CatalogRecord');
+  return (node as JsonLd | undefined) ?? null;
+}
+
 function firstString(document: JsonLd | null, keys: string[]): string | undefined {
+  const node = resourceNode(document);
   for (const key of keys) {
-    const value = document?.[key];
+    const value = node?.[key];
     if (typeof value === 'string' && value.length > 0) return value;
   }
   return undefined;
@@ -48,7 +61,8 @@ function firstString(document: JsonLd | null, keys: string[]): string | undefine
 /**
  * What a DOI registry, a crawler or a pasted link shows for this identifier.
  * `canonical` is the identifier itself, so the browsing route rendering the
- * same thing does not compete with it.
+ * same thing does not compete with it. It is the document's `@id`, which FDS
+ * makes absolute; the path stands in only when there is no document.
  */
 export function landingMetadata(
   document: JsonLd | null,
@@ -57,11 +71,12 @@ export function landingMetadata(
 ): Metadata {
   const title = firstString(document, ['title', 'dct:title', 'name']) ?? fallbackTitle;
   const description = firstString(document, ['description', 'dct:description']);
+  const canonical = firstString(document, ['@id']) ?? path;
 
   return {
     title,
     description,
-    alternates: { canonical: path },
+    alternates: { canonical },
     openGraph: { title, description, type: 'article' },
   };
 }

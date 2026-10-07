@@ -6,15 +6,13 @@ from sqlalchemy.exc import IntegrityError
 from sqlmodel import Session, col, select
 
 from app.auth.access_control import (
-    EffectivePolicy,
+    check_read,
     get_effective_access_level,
-    get_effective_policy,
     validate_policy_fields,
 )
-from app.auth.permissions import check_device_admin, check_is_admin, check_shot_operator
-from app.core.audit import record_restricted_read
-from app.core.config import S3StorageProvider, config
-from app.core.context import ReadTier, record_returned
+from app.auth.permissions import check_device_admin, check_is_admin
+from app.core.config import AzureStorageProvider, S3StorageProvider, config
+from app.core.context import ReadTier
 from app.core.naming import normalise_device_name
 from app.models.dataset import (
     Dataset,
@@ -28,11 +26,7 @@ from app.models.dataset import (
 )
 from app.models.device import Device
 from app.models.distribution import Distribution, DistributionRead
-from app.models.file_access import (
-    CredentialRequest,
-    S3Credentials,
-    anonymous_storage_options,
-)
+from app.models.file_access import CredentialRequest, anonymous_storage_options
 from app.models.identity import ANONYMOUS_USER, AuthenticatedUser
 from app.models.policy import AccessLevel
 from app.models.shot import Shot
@@ -47,7 +41,7 @@ from app.services.exceptions import (
     ResourceNotFoundError,
 )
 from app.services.file_access_service import FileAccessService
-from app.services.filters import annotation_clauses
+from app.services.filters import property_clauses
 from app.services.jsonld import map_dataset_to_dcat
 from app.services.reference_service import (
     CALIBRATION,
@@ -56,6 +50,7 @@ from app.services.reference_service import (
     ReferenceKind,
     ReferenceService,
 )
+from app.services.visibility import read_page, readable_clause, readable_only
 
 logger = structlog.get_logger(__name__)
 
@@ -71,41 +66,59 @@ class DatasetService(BaseService[Dataset, DatasetCreate, DatasetUpdate]):
         offset: int = 0,
         limit: int = 100,
         name: str | None = None,
-        annotations: list[str] | None = None,
-        shot_annotations: list[str] | None = None,
+        properties: list[str] | None = None,
+        shot_properties: list[str] | None = None,
     ) -> Sequence[Dataset]:
         """
         Global list of datasets. Filters by access level.
 
-        ``annotations`` filters on the dataset's own feature annotations;
-        ``shot_annotations`` on those of its parent shot. A dataset with no shot
-        never matches ``shot_annotations``. To scope to one device, use
+        ``properties`` filters on the dataset's own properties;
+        ``shot_properties`` on those of its parent shot. A dataset with no shot
+        never matches ``shot_properties``. To scope to one device, use
         ``get_datasets_for_device`` rather than filtering here.
         """
         statement = select(self.model)
         if name is not None:
             statement = statement.where(self.model.name == name)
         statement = statement.where(
-            *annotation_clauses(self.model.scientific_metadata, annotations)
+            *property_clauses(self.model.scientific_metadata, properties)
         )
-        statement = self._apply_shot_annotations(statement, shot_annotations)
-        statement = statement.order_by(col(Dataset.id)).offset(offset).limit(limit)
-        datasets = self.session.exec(statement).all()
-        return self._filter_accessible_datasets(datasets, user)
+        statement = self._apply_shot_properties(statement, shot_properties, user)
+        return read_page(
+            self.session,
+            Dataset,
+            statement.order_by(col(Dataset.id)),
+            user,
+            offset=offset,
+            limit=limit,
+        )
 
-    def _apply_shot_annotations(self, statement, shot_annotations: list[str] | None):
-        """Join Dataset to its parent Shot and filter on the shot's annotations.
+    def _apply_shot_properties(
+        self,
+        statement,
+        shot_properties: list[str] | None,
+        user: AuthenticatedUser,
+    ):
+        """Join Dataset to its parent Shot and filter on the shot's properties.
 
         Shared by the global and per-device listings so the two-level query behaves
         identically wherever it is offered.
+
+        Only shots ``user`` may read can match. A public dataset can belong to a
+        restricted shot, and without this the filter would answer questions about
+        that shot's properties.
         """
-        if not shot_annotations:
+        if not shot_properties:
             return statement
+        matching = property_clauses(Shot.scientific_metadata, shot_properties)
         return statement.join(
             Shot,
             (col(Dataset.shot_id) == col(Shot.id))
             & (col(Dataset.device_name) == col(Shot.device_name)),
-        ).where(*annotation_clauses(Shot.scientific_metadata, shot_annotations))
+        ).where(
+            *matching,
+            readable_clause(self.session, Shot, user, select(Shot).where(*matching)),
+        )
 
     def check_read_access(
         self,
@@ -114,61 +127,7 @@ class DatasetService(BaseService[Dataset, DatasetCreate, DatasetUpdate]):
         tier: ReadTier = ReadTier.READ,
     ) -> None:
         """Enforce read access, and record it when the resource is not public."""
-        policy = get_effective_policy(dataset, self.session)
-        self._enforce_read_policy(dataset, policy, user)
-        record_restricted_read(dataset, policy.access_level, tier)
-
-    def _enforce_read_policy(
-        self, dataset: Dataset, policy: EffectivePolicy, user: AuthenticatedUser
-    ) -> None:
-        """Enforce read access for Dataset metadata.
-
-        Resolves the full effective policy (inherited ``access_level``,
-        ``required_scopes``, ``allowed_idps``) from the
-        Dataset → Shot → Device hierarchy.
-
-        - PUBLIC / EMBARGOED: metadata is discoverable by everyone (EMBARGOED
-          restricts data, not metadata — enforced at credential vending).
-        - RESTRICTED: requires an authenticated user, then any IdP and scope
-          gates set by the policy. With no explicit ``required_scopes`` it
-          falls back to a capability check (shot operator or device admin).
-
-        Raises ``ForbiddenError`` when the user does not satisfy the policy.
-        """
-        # PUBLIC and EMBARGOED: metadata is discoverable by everyone
-        if (
-            policy.access_level == AccessLevel.PUBLIC
-            or policy.access_level == AccessLevel.EMBARGOED
-        ):
-            return
-
-        # RESTRICTED: must be authenticated
-        if user.is_anonymous:
-            raise ForbiddenError("Authentication required for this resource")
-
-        # Enforce IdP restriction if specified
-        if policy.allowed_idps is not None and user.issuer not in policy.allowed_idps:
-            raise ForbiddenError(
-                "Access denied: your identity provider is not permitted "
-                "for this resource"
-            )
-
-        # Enforce required scopes if explicitly set
-        # None → use capability fallback; [] → auth-only gate (already passed above)
-        if policy.required_scopes is not None:
-            for scope in policy.required_scopes:
-                if scope not in user.scopes:
-                    raise ForbiddenError(f"Not authorized, requires scope: {scope}")
-            return
-
-        # Capability fallback (no explicit required_scopes at any level)
-        if dataset.device_name:
-            if dataset.shot_id:
-                check_shot_operator(user, dataset.device_name)
-            else:
-                check_device_admin(user, dataset.device_name)
-        else:
-            check_is_admin(user)
+        check_read(dataset, self.session, user, tier)
 
     def create(self, obj_in: DatasetCreate, user: AuthenticatedUser) -> Dataset:
         """Create a new dataset. Handles global, device, or shot context."""
@@ -268,6 +227,7 @@ class DatasetService(BaseService[Dataset, DatasetCreate, DatasetUpdate]):
         """Build the default distribution for a dataset's ``url``."""
         return Distribution(
             url=url,
+            group=obj_in.group,
             endpoint_url=obj_in.endpoint_url,
             region=obj_in.region,
             media_type=obj_in.media_type,
@@ -597,8 +557,9 @@ class DatasetService(BaseService[Dataset, DatasetCreate, DatasetUpdate]):
             Dataset.device_name == normalise_device_name(device_name),
             Dataset.shot_id == shot_id,
         )
-        datasets = self.session.exec(statement).all()
-        return self._filter_accessible_datasets(datasets, user)
+        return read_page(
+            self.session, Dataset, statement.order_by(col(Dataset.id)), user
+        )
 
     def get_datasets_for_device(
         self,
@@ -608,8 +569,8 @@ class DatasetService(BaseService[Dataset, DatasetCreate, DatasetUpdate]):
         offset: int = 0,
         limit: int = 100,
         name: str | None = None,
-        annotations: list[str] | None = None,
-        shot_annotations: list[str] | None = None,
+        properties: list[str] | None = None,
+        shot_properties: list[str] | None = None,
     ) -> Sequence[Dataset]:
         """
         Get datasets hosted by a device, filtering by access.
@@ -619,10 +580,10 @@ class DatasetService(BaseService[Dataset, DatasetCreate, DatasetUpdate]):
         device as a whole rather than to any one shot, ``SHOT`` only those
         attached to one of the device's shots.
 
-        ``annotations`` filters on each dataset's own feature annotations;
-        ``shot_annotations`` on those of its parent shot, which answers questions
+        ``properties`` filters on each dataset's own properties;
+        ``shot_properties`` on those of its parent shot, which answers questions
         spanning both levels (e.g. equilibrium datasets from shots that had ELMs).
-        Since device-level datasets have no shot, combining ``shot_annotations``
+        Since device-level datasets have no shot, combining ``shot_properties``
         with ``scope=DEVICE`` matches nothing.
         """
         statement = select(Dataset).where(
@@ -635,12 +596,17 @@ class DatasetService(BaseService[Dataset, DatasetCreate, DatasetUpdate]):
         if name is not None:
             statement = statement.where(Dataset.name == name)
         statement = statement.where(
-            *annotation_clauses(Dataset.scientific_metadata, annotations)
+            *property_clauses(Dataset.scientific_metadata, properties)
         )
-        statement = self._apply_shot_annotations(statement, shot_annotations)
-        statement = statement.order_by(col(Dataset.id)).offset(offset).limit(limit)
-        datasets = self.session.exec(statement).all()
-        return self._filter_accessible_datasets(datasets, user)
+        statement = self._apply_shot_properties(statement, shot_properties, user)
+        return read_page(
+            self.session,
+            Dataset,
+            statement.order_by(col(Dataset.id)),
+            user,
+            offset=offset,
+            limit=limit,
+        )
 
     def get_datasets_for_shot(
         self,
@@ -649,7 +615,7 @@ class DatasetService(BaseService[Dataset, DatasetCreate, DatasetUpdate]):
         user: AuthenticatedUser = ANONYMOUS_USER,
         offset: int = 0,
         limit: int = 100,
-        annotations: list[str] | None = None,
+        properties: list[str] | None = None,
     ) -> Sequence[Dataset]:
         """
         Get all datasets for a specific shot (scoped by device name).
@@ -660,13 +626,12 @@ class DatasetService(BaseService[Dataset, DatasetCreate, DatasetUpdate]):
                 Dataset.shot_id == shot_id,
                 Dataset.device_name == normalise_device_name(device_name),
             )
-            .where(*annotation_clauses(Dataset.scientific_metadata, annotations))
+            .where(*property_clauses(Dataset.scientific_metadata, properties))
             .order_by(col(Dataset.id))
-            .offset(offset)
-            .limit(limit)
         )
-        datasets = self.session.exec(statement).all()
-        return self._filter_accessible_datasets(datasets, user)
+        return read_page(
+            self.session, Dataset, statement, user, offset=offset, limit=limit
+        )
 
     def to_read_model(
         self,
@@ -693,6 +658,7 @@ class DatasetService(BaseService[Dataset, DatasetCreate, DatasetUpdate]):
             dataset,
             update={
                 "url": default_dist.url if default_dist else None,
+                "group": default_dist.group if default_dist else None,
                 "media_type": default_dist.media_type if default_dist else None,
                 "format": default_dist.format if default_dist else None,
                 "distributions": [
@@ -734,12 +700,14 @@ class DatasetService(BaseService[Dataset, DatasetCreate, DatasetUpdate]):
         include_geometry: bool = False,
         include_calibration: bool = False,
         include_annotations: bool = False,
+        user: AuthenticatedUser = ANONYMOUS_USER,
     ) -> dict[str, Any]:
         """Build the dataset's DCAT/JSON-LD document, resolving the requested
-        related datasets (geometry, calibration, annotations) into qualified
+        related datasets (geometry, calibration, properties) into qualified
         relations."""
         enriched = self.to_read_model(
             dataset,
+            user=user,
             include_geometry=include_geometry,
             include_calibration=include_calibration,
             include_annotations=include_annotations,
@@ -759,16 +727,20 @@ class DatasetService(BaseService[Dataset, DatasetCreate, DatasetUpdate]):
         user: AuthenticatedUser | None = None,
     ) -> list[DatasetRead] | None:
         """
-        Dataset annotations as read models, or ``None``.
+        Dataset properties as read models, or ``None``.
         """
-        annotations = AnnotationService(self.session).for_dataset(dataset)
+        properties = readable_only(
+            self.session,
+            AnnotationService(self.session).for_dataset(dataset),
+            user or ANONYMOUS_USER,
+        )
         models = [
             self.to_read_model(
-                annotation,
+                prop,
                 include_storage_options=include_storage_options,
                 user=user,
             )
-            for annotation in annotations
+            for prop in properties
         ]
         return models or None
 
@@ -813,9 +785,14 @@ class DatasetService(BaseService[Dataset, DatasetCreate, DatasetUpdate]):
         else:
             resolved = service.resolve(shot, references)
             ordered = [resolved[role] for role in references]
+        readable = readable_only(
+            self.session,
+            [v for v in ordered if v is not None],
+            user or ANONYMOUS_USER,
+        )
         seen: set[int] = set()
         models: list[DatasetRead] = []
-        for version in ordered:
+        for version in readable:
             if version is None or version.id is None or version.id in seen:
                 continue
             seen.add(version.id)
@@ -896,31 +873,15 @@ class DatasetService(BaseService[Dataset, DatasetCreate, DatasetUpdate]):
                 )
         return models
 
-    def _filter_accessible_datasets(
-        self, datasets: Sequence[Dataset], user: AuthenticatedUser
-    ) -> list[Dataset]:
-        """
-        Helper to filter a list of datasets, returning only those the user can read.
-        """
-        accessible_datasets = []
-        for dataset in datasets:
-            try:
-                self.check_read_access(dataset, user, ReadTier.LISTED)
-                accessible_datasets.append(dataset)
-            except ForbiddenError:
-                continue
-        record_returned(len(accessible_datasets))
-        return accessible_datasets
-
     def enrich_with_storage_options(
         self, read_models: list[DatasetRead], user: AuthenticatedUser
     ) -> list[DatasetRead]:
         """
-        Batch-injects ``storage_options`` into DatasetRead models in the shape
-        declared by the default distribution's ``storage_options_type``
-        (``fsspec_s3`` or ``icechunk_s3``). Public datasets receive anonymous
-        options directly; non-public datasets go through credential vending via
-        FileAccessService.
+        Batch-injects opener-ready ``storage_options`` into DatasetRead models.
+
+        Public datasets receive anonymous options directly. Non-public datasets
+        go through credential vending via FileAccessService, rendered exactly
+        as the bulk credentials endpoint renders them.
         """
         if not read_models:
             return read_models
@@ -933,53 +894,31 @@ class DatasetService(BaseService[Dataset, DatasetCreate, DatasetUpdate]):
         ]
 
         for model in public:
-            if not model.url:
-                continue
             default_dist = self._default_distribution(model)
-            target_type = default_dist.storage_options_type if default_dist else None
-            if target_type is None:
-                # Distribution opted out of automated storage_options
-                # (e.g. plain HTTPS download, MDSplus reference, etc.).
+            if not model.url or default_dist is None:
                 continue
-            endpoint_url = default_dist.endpoint_url if default_dist else None
-            region = (
-                default_dist.region if default_dist and default_dist.region else None
-            ) or self._region_for_endpoint(endpoint_url)
-            opts = anonymous_storage_options(
-                model.url, endpoint_url, region, target_type
+            target_type = default_dist.storage_options_type
+            endpoint_url = default_dist.endpoint_url
+            model.storage_options = anonymous_storage_options(
+                model.url,
+                target_type,
+                endpoint_url=endpoint_url,
+                region=default_dist.region or self._region_for_endpoint(endpoint_url),
+                account_name=self._account_for_endpoint(endpoint_url),
             )
-            if opts is None:
+            if model.storage_options is None and target_type is not None:
                 logger.warning("storage_options.unavailable", url=model.url)
-            elif isinstance(opts, dict):
-                # Azure / GCS plain-dict shapes — not yet typed as StorageOptions.
-                # Skip injection rather than violate the field's declared type.
-                logger.warning("storage_options.untyped_scheme", url=model.url)
-            else:
-                model.storage_options = opts
 
         credentialed_urls = [m.url for m in non_public if m.url]
         if credentialed_urls:
             manifest = FileAccessService(self.session).generate_session_credentials(
                 user=user,
                 request=CredentialRequest(data_urls=credentialed_urls),
+                include_storage_options=True,
             )
             for model in non_public:
                 if model.url and (cred := manifest.resource_map.get(model.url)):
-                    default_dist = self._default_distribution(model)
-                    target_type = (
-                        default_dist.storage_options_type if default_dist else None
-                    )
-                    if target_type is None:
-                        continue
-                    region_override = (
-                        default_dist.region
-                        if default_dist and default_dist.region
-                        else None
-                    )
-                    if isinstance(cred, S3Credentials):
-                        model.storage_options = cred.to_storage_options(
-                            target_type, region=region_override
-                        )
+                    model.storage_options = cred.storage_options
 
         return read_models
 
@@ -992,7 +931,10 @@ class DatasetService(BaseService[Dataset, DatasetCreate, DatasetUpdate]):
 
     @staticmethod
     def _region_for_endpoint(endpoint_url: str | None) -> str | None:
-        for pc in config.STORAGE_PROVIDERS:
-            if isinstance(pc, S3StorageProvider) and pc.endpoint_url == endpoint_url:
-                return pc.region
-        return None
+        pc = config.storage_provider("s3", endpoint_url)
+        return pc.region if isinstance(pc, S3StorageProvider) else None
+
+    @staticmethod
+    def _account_for_endpoint(endpoint_url: str | None) -> str | None:
+        pc = config.storage_provider("azure", endpoint_url)
+        return pc.storage_account if isinstance(pc, AzureStorageProvider) else None

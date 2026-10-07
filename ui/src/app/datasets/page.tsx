@@ -6,8 +6,8 @@ import Link from 'next/link';
 import { Database, Server, Search } from 'lucide-react';
 import { fetcher, API_BASE } from '@/lib/api';
 import { Device, Dataset } from '@/lib/types';
-import { annotationFacets, annotationQuery, withQuery } from '@/lib/features';
-import { AnnotationFilter } from '@/components/annotation-filter';
+import { availableProperties, propertyQuery, withQuery } from '@/lib/properties';
+import { PropertyFilter } from '@/components/property-filter';
 import { DatasetCard } from '@/components/dataset-card';
 import { DatasetResults } from '@/components/dataset-results';
 import { DeviceDatasets } from '@/components/device-datasets';
@@ -21,13 +21,13 @@ export default function DatasetsPage() {
   const { data: allDatasets } = useSWR<Dataset[]>(ALL_DATASETS, fetcher);
   const [searchQuery, setSearchQuery] = useState('');
   const [filterType, setFilterType] = useState<'all' | 'global' | 'device'>('all');
-  const [annotations, setAnnotations] = useState<string[]>([]);
+  const [propertyTokens, setPropertyTokens] = useState<string[]>([]);
 
-  // Only the dataset's own annotations here. Filtering on a parent shot's would
+  // Only the dataset's own properties here. Filtering on a parent shot's would
   // need the shots of every device, and shots are only listed under one.
   const { data: annotated, isLoading: annotatedLoading } = useSWR<Dataset[]>(
-    annotations.length > 0
-      ? withQuery(ALL_DATASETS, annotationQuery('annotation', annotations))
+    propertyTokens.length > 0
+      ? withQuery(ALL_DATASETS, propertyQuery('property', propertyTokens))
       : null,
     fetcher,
     { keepPreviousData: true }
@@ -62,7 +62,7 @@ export default function DatasetsPage() {
             placeholder="Search devices or datasets..."
             value={searchQuery}
             onChange={(e) => setSearchQuery(e.target.value)}
-            className="w-full pl-10 pr-4 py-2 bg-card/50 border border-border rounded-lg text-foreground placeholder-muted-foreground focus:outline-none focus:border-border transition-colors"
+            className="w-full pl-10 pr-4 py-2 bg-card/50 border border-border rounded-lg text-foreground placeholder-muted-foreground focus:outline-hidden focus:border-border transition-colors"
           />
         </div>
         <div className="flex gap-2">
@@ -93,17 +93,17 @@ export default function DatasetsPage() {
         </div>
       </div>
 
-      <AnnotationFilter
-        label="Filter by annotation"
-        facets={annotationFacets(allDatasets)}
-        selected={annotations}
-        onChange={setAnnotations}
+      <PropertyFilter
+        label="Filter by scientific metadata"
+        properties={availableProperties(allDatasets)}
+        selected={propertyTokens}
+        onChange={setPropertyTokens}
       />
 
       {/* An annotation filter is a query, not a browse, so it answers with one
           flat list. The sections below are organised by where a dataset sits,
           which would hide the shot-level matches entirely. */}
-      {annotations.length > 0 && (
+      {propertyTokens.length > 0 && (
         <div>
           <div className="flex items-center gap-3 mb-4">
             <div className="bg-muted p-2 rounded-lg text-foreground">
@@ -126,7 +126,7 @@ export default function DatasetsPage() {
       )}
 
       {/* Global Datasets Section */}
-      {annotations.length === 0 && (filterType === 'all' || filterType === 'global') && (
+      {propertyTokens.length === 0 && (filterType === 'all' || filterType === 'global') && (
         <div className="mb-8">
           <div className="flex items-center gap-3 mb-4">
             <div className="bg-muted p-2 rounded-lg text-foreground">
@@ -152,7 +152,7 @@ export default function DatasetsPage() {
       )}
 
       {/* Device-Linked Datasets Section */}
-      {annotations.length === 0 && (filterType === 'all' || filterType === 'device') && (
+      {propertyTokens.length === 0 && (filterType === 'all' || filterType === 'device') && (
         <div>
           <div className="flex items-center gap-3 mb-4">
             <div className="bg-muted p-2 rounded-lg text-foreground">
@@ -202,12 +202,6 @@ export default function DatasetsPage() {
                               {device.description || 'No description available'}
                             </p>
                           </div>
-                        </Link>
-                        <Link
-                          href={`/devices/${device.name}/shots`}
-                          className="px-4 py-2 bg-muted hover:bg-accent text-foreground text-sm rounded-lg transition-colors"
-                        >
-                          View Shots
                         </Link>
                       </div>
                     </div>

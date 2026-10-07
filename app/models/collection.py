@@ -1,3 +1,4 @@
+from datetime import date
 from typing import TYPE_CHECKING
 
 from sqlmodel import (
@@ -10,7 +11,13 @@ from sqlmodel import (
     UniqueConstraint,
 )
 
-from .mixins import DescriptiveMixin, ScientificMetadataMixin, TimestampMixin
+from .mixins import (
+    DescriptiveMixin,
+    IssuedMixin,
+    PersistentIdentifierMixin,
+    ScientificMetadataMixin,
+    TimestampMixin,
+)
 from .policy import AccessLevel
 from .scientific_metadata import ScientificProperty
 
@@ -45,7 +52,11 @@ class CollectionMember(SQLModel, table=True):
 
 
 class CollectionBase(
-    DescriptiveMixin, ScientificMetadataMixin, TimestampMixin, SQLModel
+    DescriptiveMixin,
+    ScientificMetadataMixin,
+    PersistentIdentifierMixin,
+    IssuedMixin,
+    SQLModel,
 ):
     """Core metadata for a Collection (maps to ``dcat:Catalog``).
 
@@ -106,7 +117,7 @@ class CollectionBase(
     )
 
 
-class Collection(CollectionBase, table=True):
+class Collection(CollectionBase, TimestampMixin, table=True):
     """ORM table for a Collection (``dcat:Catalog``).
 
     A Collection is uniquely identified within the triple (device_name, shot_id,
@@ -151,7 +162,7 @@ class Collection(CollectionBase, table=True):
     datasets: list["Dataset"] = Relationship(link_model=CollectionDataset)
     # Child Collections are NOT declared as a SQLModel Relationship here because
     # SQLModel cannot automatically resolve self-referential M2M join columns.
-    # Use CollectionService._get_child_collections() instead.
+    # Use CollectionService.get_child_collections() instead.
 
 
 class CollectionCreate(CollectionBase):
@@ -166,7 +177,7 @@ class CollectionCreate(CollectionBase):
     origin: str | None = None
 
 
-class CollectionRead(CollectionBase):
+class CollectionRead(CollectionBase, TimestampMixin):
     """Collection response schema.
 
     Member Datasets are inlined as ``DatasetRead`` objects. Child Collections
@@ -193,6 +204,8 @@ class CollectionUpdate(SQLModel):
     """
 
     name: str | None = None
+    persistent_identifier: str | None = None
+    issued: date | None = None
     device_name: str | None = None
     shot_id: str | None = None
     activity_id: int | None = None

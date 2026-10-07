@@ -7,11 +7,16 @@ from app.models.activity import (
 )
 from app.models.dataset import DatasetCreate
 from app.models.policy import AccessLevel
-from app.models.source import SourceCreate, SourceKind
+from app.models.source import Source, SourceCreate, SourceKind
 from app.services.activity_service import ActivityService
 from app.services.dataset_service import DatasetService
-from app.services.jsonld import FUEL_ORCHESTRATOR_ROLE, map_dataset_to_dcat
+from app.services.jsonld import (
+    FUEL_ORCHESTRATOR_ROLE,
+    map_dataset_to_dcat,
+    map_source_to_dcat,
+)
 from app.services.source_service import SourceService
+from tests.conftest import resource
 
 admin = AuthenticatedUser(id="admin", scopes=("fds-admin",))
 BASE = "http://testserver"
@@ -62,7 +67,7 @@ def test_delegate_agent_serialises_acted_on_behalf_of(session):
     """The delegate (executor) node carries prov:actedOnBehalfOf to the responsible."""
     dataset, code_id, scheduler_id = _dataset_from_delegated_run(session)
 
-    prov = map_dataset_to_dcat(dataset, BASE)["prov:wasGeneratedBy"]
+    prov = resource(map_dataset_to_dcat(dataset, BASE))["prov:wasGeneratedBy"]
     executor = prov["prov:wasAssociatedWith"]
     assert executor["@id"] == f"{BASE}/sources/{code_id}"
     assert executor["prov:actedOnBehalfOf"] == [
@@ -74,10 +79,21 @@ def test_non_delegate_agent_has_no_acted_on_behalf_of(session):
     """An orchestrator that is not a subordinate carries no prov:actedOnBehalfOf."""
     dataset, _code_id, _scheduler_id = _dataset_from_delegated_run(session)
 
-    prov = map_dataset_to_dcat(dataset, BASE)["prov:wasGeneratedBy"]
+    prov = resource(map_dataset_to_dcat(dataset, BASE))["prov:wasGeneratedBy"]
     orchestrator = next(
         assoc["prov:agent"]
         for assoc in prov["prov:qualifiedAssociation"]
         if assoc["prov:hadRole"] == {"@id": FUEL_ORCHESTRATOR_ROLE}
     )
     assert "prov:actedOnBehalfOf" not in orchestrator
+
+
+def test_instrument_source_document_is_an_entity_not_an_agent():
+    """An instrument measures but does not act, as in ``prov:used``."""
+    instrument = Source(id=6, name="thomson", kind=SourceKind.INSTRUMENT)
+
+    node = map_source_to_dcat(instrument, BASE)
+
+    assert node["@id"] == f"{BASE}/sources/6"
+    assert node["@type"] == "prov:Entity"
+    assert node["dct:title"] == "thomson"

@@ -5,7 +5,10 @@ from datetime import datetime
 from fastapi.testclient import TestClient
 
 from app.models.coverage import Coverage, DateRange, ShotRange
+from app.models.dataset import DatasetCreate
+from app.models.policy import AccessLevel
 from app.services.jsonld import map_dataset_to_dcat
+from tests.conftest import resource
 
 THOMSON = Coverage(shot_ranges=[ShotRange(from_shot="150")])
 
@@ -82,8 +85,10 @@ def test_jsonld_qualified_relation_resolved_geometry(
     signal = make_signal(["thomson_positions"])
 
     read_model = datasets.to_read_model(signal, include_geometry=True)
-    doc = map_dataset_to_dcat(
-        read_model, "http://testserver", geometry=read_model.geometry
+    doc = resource(
+        map_dataset_to_dcat(
+            read_model, "http://testserver", geometry=read_model.geometry
+        )
     )
     relations = doc["dcat:qualifiedRelation"]
     assert len(relations) == 1
@@ -94,3 +99,30 @@ def test_jsonld_qualified_relation_resolved_geometry(
     assert relation["dct:temporal"]["startDate"].startswith("2008-01-01")
     assert relation["dct:temporal"]["endDate"].startswith("2009-01-01")
     assert "dct:references" not in doc
+
+
+def test_include_geometry_resolves_only_readable_versions(
+    test_client: TestClient, make_version, make_signal, datasets, admin_user, session
+):
+    public = make_version("thomson_geometry", ["thomson_positions"], THOMSON)
+    draft = datasets.create(
+        DatasetCreate(
+            name="thomson_geometry_draft",
+            device_name="MAST",
+            geometry_roles=["thomson_fibres"],
+            applies_to=THOMSON,
+            access_level=AccessLevel.RESTRICTED,
+            required_scopes=["mast_team"],
+            url="s3://geometry/draft.nc",
+        ),
+        admin_user,
+    )
+    session.commit()
+    signal = make_signal(["thomson_positions", "thomson_fibres"])
+
+    resp = test_client.get(f"/v1/datasets/id/{signal.id}?include_geometry=true")
+
+    assert resp.status_code == 200
+    ids = [g["id"] for g in resp.json()["geometry"]]
+    assert ids == [public.id]
+    assert draft.id not in ids

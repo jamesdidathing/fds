@@ -213,12 +213,10 @@ def mock_jwt_decode(mocker):
 
 
 @pytest.fixture
-def mock_s3_provider(mocker):
-    # Mock the get_provider_for_protocol to return a mock S3 provider
+def mock_credential_provider(mocker):
+    # One provider for every backend and endpoint, vending nothing until a test says what.
     mock_prov = mocker.Mock()
-    # Providers return a mapping payload; use an empty mapping by default.
     mock_prov.generate_credentials.return_value = {}
-    # When initialized, S3CredentialProvider will be used, but we want to intercept the factory
     mocker.patch(
         "app.services.file_access_service.get_provider_for_endpoint",
         return_value=mock_prov,
@@ -255,3 +253,17 @@ def log_lines(monkeypatch):
 
     monkeypatch.undo()
     setup_logging()
+
+
+def resource(document: dict) -> dict:
+    """The resource node of a served JSON-LD document, without FDS's record of it."""
+    return next(
+        node for node in document["@graph"] if node["@type"] != "dcat:CatalogRecord"
+    )
+
+
+def record(document: dict) -> dict:
+    """FDS's ``dcat:CatalogRecord`` for the resource a document describes."""
+    return next(
+        node for node in document["@graph"] if node["@type"] == "dcat:CatalogRecord"
+    )

@@ -24,6 +24,7 @@ from app.services.jsonld import (
     FUEL_ORCHESTRATOR_ROLE,
 )
 from app.services.source_service import SourceService
+from tests.conftest import resource
 
 
 def test_jsonld_provenance(
@@ -88,11 +89,12 @@ def test_jsonld_provenance(
     assert resp.status_code == 200
     assert resp.headers["content-type"] == "application/ld+json"
 
-    data = resp.json()
+    document = resp.json()
+    data = resource(document)
 
     # 3. Verify PROV-O structure
-    assert "@context" in data
-    assert "prov" in data["@context"]
+    assert "@context" in document
+    assert "prov" in document["@context"]
     assert "prov:wasGeneratedBy" in data
 
     prov = data["prov:wasGeneratedBy"]
@@ -103,7 +105,14 @@ def test_jsonld_provenance(
     agent = prov["prov:wasAssociatedWith"]
     assert agent["@type"] == "prov:SoftwareAgent"
     assert agent["dct:title"] == "prov-source"
-    assert agent["dcat:version"] == "v1.0"
+    # The version is this run's, not the Source's: it rides on the association
+    # as the plan the executor followed, and the shared agent node has none.
+    assert "dcat:version" not in agent
+    (association,) = prov["prov:qualifiedAssociation"]
+    assert association["prov:hadPlan"] == {"@type": "prov:Plan", "dcat:version": "v1.0"}
+
+    # The embedded activity is named, so its own document can be followed.
+    assert prov["@id"] == f"http://testserver/activities/{activity.id}"
 
     # Verify parameters
     assert prov["prov:value"] == {"run_id": 99}
@@ -188,7 +197,7 @@ def test_jsonld_provenance_with_timestamps(
     url = f"/v1/datasets/id/{dataset.id}"
     resp = test_client.get(url, headers=headers)
     assert resp.status_code == 200
-    prov = resp.json()["prov:wasGeneratedBy"]
+    prov = resource(resp.json())["prov:wasGeneratedBy"]
     assert "prov:startedAtTime" in prov
     assert "prov:endedAtTime" in prov
 
@@ -251,12 +260,13 @@ def test_jsonld_provenance_with_inputs(
     resp = test_client.get(url, headers=headers)
     assert resp.status_code == 200
 
-    prov = resp.json()["prov:wasGeneratedBy"]
+    prov = resource(resp.json())["prov:wasGeneratedBy"]
     assert "prov:used" in prov
     used = prov["prov:used"]
     assert len(used) == 1
     assert used[0]["@type"] == "prov:Entity"
     assert str(raw.id) in used[0]["@id"]
+    assert used[0]["dct:title"] == "raw-input"
     usage = prov["prov:qualifiedUsage"]
     assert len(usage) == 1
     assert usage[0]["prov:hadRole"] == {"@id": FUEL_INPUT_ROLE}
@@ -309,13 +319,14 @@ def test_jsonld_provenance_with_instrument(
     resp = test_client.get(f"/v1/datasets/id/{raw.id}", headers=headers)
     assert resp.status_code == 200
 
-    prov = resp.json()["prov:wasGeneratedBy"]
+    prov = resource(resp.json())["prov:wasGeneratedBy"]
     usage = prov["prov:qualifiedUsage"]
     instrument_usages = [
         u for u in usage if u["prov:hadRole"] == {"@id": FUEL_INSTRUMENT_ROLE}
     ]
     assert len(instrument_usages) == 1
     assert str(diagnostic.id) in instrument_usages[0]["prov:entity"]["@id"]
+    assert instrument_usages[0]["prov:entity"]["dct:title"] == diagnostic.name
     # No agent: the acquisition is agent-less, so no executor association.
     assert "prov:wasAssociatedWith" not in prov
 
@@ -374,7 +385,7 @@ def test_jsonld_multi_agent_associations(
     resp = test_client.get(f"/v1/datasets/id/{profile.id}", headers=headers)
     assert resp.status_code == 200
 
-    prov = resp.json()["prov:wasGeneratedBy"]
+    prov = resource(resp.json())["prov:wasGeneratedBy"]
     # Executor still serialises as the primary wasAssociatedWith (a SoftwareAgent).
     assert prov["prov:wasAssociatedWith"]["@type"] == "prov:SoftwareAgent"
     assert str(code.id) in prov["prov:wasAssociatedWith"]["@id"]

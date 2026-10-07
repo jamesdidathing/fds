@@ -4,16 +4,22 @@ import { useState } from 'react';
 import useSWR from 'swr';
 import Link from 'next/link';
 import { fetcher, API_BASE } from '@/lib/api';
-import { Dataset, Shot } from '@/lib/types';
+import { AvailableProperties, Dataset } from '@/lib/types';
 import { Database, ChevronRight, Server } from 'lucide-react';
 import { useDeviceLabel } from '@/lib/use-device-label';
-import { annotationFacets, annotationQuery, withQuery } from '@/lib/features';
-import { AnnotationFilter } from '@/components/annotation-filter';
+import { availableProperties, propertyQuery, withQuery } from '@/lib/properties';
+import { PropertyFilter } from '@/components/property-filter';
 import { DatasetResults } from '@/components/dataset-results';
+import { SidePanelLayout } from '@/components/side-panel-layout';
+import { LoadMore } from '@/components/load-more';
+import { usePagedList } from '@/lib/use-paged-list';
 import { DeviceDatasets } from '@/components/device-datasets';
-import { ShotList, shotsUrl } from '@/components/shot-list';
+import { ShotList, shotPropertiesUrl } from '@/components/shot-list';
+import { JsonLdPanel } from '@/components/jsonld-panel';
 
 type Tab = 'shots' | 'shot-datasets' | 'datasets';
+
+const DATASET_PAGE_SIZE = 100;
 
 function TabButton({
   active,
@@ -50,7 +56,7 @@ function TabButton({
 }
 
 /**
- * The device's shot-level datasets, filterable on their own annotations and on
+ * The device's shot-level datasets, filterable on their own properties and on
  * those of the shot they belong to. The second is the cross-level question:
  * "the equilibrium datasets from shots that had ELMs" is one request, not a shot
  * query followed by a request per shot.
@@ -58,27 +64,50 @@ function TabButton({
  * Scoped to shot-level datasets deliberately. A device-level dataset has no
  * parent shot, so it could never satisfy a shot annotation filter.
  */
-function ShotDatasets({ deviceName, shots }: { deviceName: string; shots?: Shot[] }) {
-  const [annotations, setAnnotations] = useState<string[]>([]);
-  const [shotAnnotations, setShotAnnotations] = useState<string[]>([]);
+function ShotDatasets({
+  deviceName,
+  aside,
+}: {
+  deviceName: string;
+  aside?: React.ReactNode;
+}) {
+  const [propertyTokens, setPropertyTokens] = useState<string[]>([]);
+  const [shotPropertyTokens, setShotPropertyTokens] = useState<string[]>([]);
+
+  // The shot chips describe every shot on the device, not the hundred a
+  // listing would return. Same SWR key as ShotList and the tab count above,
+  // so all three share one request.
+  const { data: shotProperties } = useSWR<AvailableProperties>(
+    deviceName ? shotPropertiesUrl(deviceName) : null,
+    fetcher
+  );
 
   const baseUrl = `${API_BASE}/devices/${deviceName}/datasets?scope=shot`;
-  const { data: allDatasets } = useSWR<Dataset[]>(deviceName ? baseUrl : null, fetcher);
+  // The dataset chips are read from this first page alone, since no endpoint
+  // aggregates dataset properties across a device.
+  const { data: firstPage } = useSWR<Dataset[]>(deviceName ? baseUrl : null, fetcher);
+  const datasetProperties = availableProperties(firstPage);
+  const shotPropertyList = shotProperties?.properties ?? [];
 
-  // keepPreviousData so the list settles under the chips rather than blanking.
-  const { data: datasets, error, isLoading } = useSWR<Dataset[]>(
+  const {
+    items: datasets,
+    error,
+    isLoading,
+    done,
+    loadingMore,
+    loadMore,
+  } = usePagedList<Dataset>(
     deviceName
       ? withQuery(
           baseUrl,
-          annotationQuery('annotation', annotations),
-          annotationQuery('shot_annotation', shotAnnotations)
+          propertyQuery('property', propertyTokens),
+          propertyQuery('shot_property', shotPropertyTokens)
         )
       : null,
-    fetcher,
-    { keepPreviousData: true }
+    DATASET_PAGE_SIZE
   );
 
-  const filtered = annotations.length > 0 || shotAnnotations.length > 0;
+  const filtered = propertyTokens.length > 0 || shotPropertyTokens.length > 0;
 
   if (error) return <div className="py-8 text-destructive">Failed to load datasets.</div>;
   if (isLoading && !datasets) {
@@ -86,26 +115,27 @@ function ShotDatasets({ deviceName, shots }: { deviceName: string; shots?: Shot[
   }
 
   return (
-    <div>
-      <AnnotationFilter
-        label="Filter by dataset annotation"
-        facets={annotationFacets(allDatasets)}
-        selected={annotations}
-        onChange={setAnnotations}
-      />
-      <AnnotationFilter
-        label="Filter by shot annotation"
-        facets={annotationFacets(shots)}
-        selected={shotAnnotations}
-        onChange={setShotAnnotations}
-      />
-
-      {filtered && (
-        <p className="text-sm text-muted-foreground mb-4">
-          {datasets?.length ?? 0} of {allDatasets?.length ?? 0} datasets
-        </p>
-      )}
-
+    <SidePanelLayout
+      side={
+        (datasetProperties.length > 0 || shotPropertyList.length > 0 || aside) && (
+          <>
+            <PropertyFilter
+              label="Filter by dataset property"
+              properties={datasetProperties}
+              selected={propertyTokens}
+              onChange={setPropertyTokens}
+            />
+            <PropertyFilter
+              label="Filter by shot property"
+              properties={shotPropertyList}
+              selected={shotPropertyTokens}
+              onChange={setShotPropertyTokens}
+            />
+            {aside}
+          </>
+        )
+      }
+    >
       <DatasetResults
         datasets={datasets}
         emptyMessage={
@@ -114,7 +144,10 @@ function ShotDatasets({ deviceName, shots }: { deviceName: string; shots?: Shot[
             : 'No shot-level datasets for this device.'
         }
       />
-    </div>
+      {datasets && datasets.length > 0 && (
+        <LoadMore onLoad={loadMore} loading={loadingMore} done={done} />
+      )}
+    </SidePanelLayout>
   );
 }
 
@@ -122,14 +155,20 @@ export default function DeviceDetail({ deviceName }: { deviceName: string }) {
   const deviceLabel = useDeviceLabel(deviceName);
   const [activeTab, setActiveTab] = useState<Tab>('shots');
 
-  // Shared with ShotList below (same url, so SWR makes one request) and used
-  // here for the tab count and for the shot annotation chips on the datasets tab.
-  const { data: shots } = useSWR<Shot[]>(deviceName ? shotsUrl(deviceName) : null, fetcher);
+  // Shared with ShotList and ShotDatasets below (same url, so SWR makes one
+  // request). The tab count is the device's shot count: the listing's would be
+  // its page length, which reads 100 for a device holding thousands.
+  const { data: shotProperties } = useSWR<AvailableProperties>(
+    deviceName ? shotPropertiesUrl(deviceName) : null,
+    fetcher
+  );
 
   const { data: datasets, error: datasetsError, isLoading: datasetsLoading } = useSWR<Dataset[]>(
     deviceName ? `${API_BASE}/devices/${deviceName}/datasets?scope=device` : null,
     fetcher
   );
+
+  const jsonLd = <JsonLdPanel url={`${API_BASE}/devices/${deviceName}`} />;
 
   return (
     <div className="container mx-auto px-4 py-8">
@@ -152,7 +191,7 @@ export default function DeviceDetail({ deviceName }: { deviceName: string }) {
       <div className="flex gap-1 mb-6 border-b border-border">
         <TabButton
           active={activeTab === 'shots'}
-          count={shots?.length}
+          count={shotProperties?.total}
           onClick={() => setActiveTab('shots')}
         >
           Shots
@@ -172,13 +211,16 @@ export default function DeviceDetail({ deviceName }: { deviceName: string }) {
         </TabButton>
       </div>
 
-      {activeTab === 'shots' && <ShotList deviceName={deviceName} />}
+      {activeTab === 'shots' && <ShotList deviceName={deviceName} aside={jsonLd} />}
 
-      {activeTab === 'shot-datasets' && <ShotDatasets deviceName={deviceName} shots={shots} />}
+      {activeTab === 'shot-datasets' && (
+        <ShotDatasets deviceName={deviceName} aside={jsonLd} />
+      )}
 
-      {/* Device Datasets Tab */}
+      {/* Device Datasets Tab: no filters, so no side column to hold the JSON-LD. */}
       {activeTab === 'datasets' && (
         <div>
+          <div className="mb-8">{jsonLd}</div>
           {datasetsLoading && <div className="py-8 text-muted-foreground">Loading datasets...</div>}
           {datasetsError && <div className="py-8 text-destructive">Failed to load datasets.</div>}
           {!datasetsLoading && !datasetsError && datasets && datasets.length > 0 && (

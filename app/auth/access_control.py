@@ -1,14 +1,20 @@
+from collections.abc import Sequence
 from dataclasses import dataclass
+from typing import Any
 
 from sqlmodel import Session, select
 
+from app.auth.permissions import check_device_admin, check_is_admin, check_shot_operator
+from app.core.audit import record_restricted_read
 from app.core.config import config
+from app.core.context import ReadTier
 from app.models.collection import Collection
 from app.models.dataset import Dataset
 from app.models.device import Device
+from app.models.identity import AuthenticatedUser
 from app.models.policy import AccessLevel
 from app.models.shot import Shot
-from app.services.exceptions import FDSValidationError
+from app.services.exceptions import FDSValidationError, ForbiddenError
 
 DEFAULT_ACCESS_LEVEL = AccessLevel.RESTRICTED
 
@@ -34,94 +40,175 @@ class EffectivePolicy:
     allowed_idps: list[str] | None
 
 
-def get_effective_access_level(
-    obj: Collection | Dataset | Shot | Device, session: Session
-) -> AccessLevel:
+Policied = Collection | Dataset | Shot | Device
+
+# The three fields that inherit. Each resolves independently: a Shot may set
+# access_level while required_scopes still comes from its Device.
+_POLICY_FIELDS = ("access_level", "required_scopes", "allowed_idps")
+
+
+def policy_chain(obj: Policied, session: Session) -> list[Policied]:
+    """``obj`` and the objects it inherits policy from, nearest first.
+
+    Collection/Dataset → Shot → Device. A Collection or Dataset not attached to
+    a shot inherits from its device directly, and a Device inherits from nothing
+    because it has no ``device_name`` of its own.
+
+    Walked once and returned as a list, because all three policy fields resolve
+    over the same chain and loading it per field is where this used to spend its
+    queries.
     """
-    Calculates the effective access level for an object based on inheritance.
+    chain: list[Policied] = [obj]
 
-    Specific overrides general. The resolution order is:
-    Collection/Dataset → Shot → Device → Global Default
-
-    Collections follow the same inheritance chain as Datasets: if no
-    ``access_level`` is set directly, the enclosing Shot's policy is checked,
-    then the Device's, and finally the global default is applied.
-    """
-    # 1. Direct override
-    if obj.access_level:
-        return obj.access_level
-
-    # 2. Inherit from Shot (if applicable)
     if isinstance(obj, (Dataset, Collection)) and obj.shot_id and obj.device_name:
         shot = session.get(Shot, (obj.device_name, obj.shot_id))
         if shot:
-            return get_effective_access_level(shot, session)
+            chain.append(shot)
 
-    # 3. Inherit from Device
-    device = None
-    if isinstance(obj, (Dataset, Collection, Shot)) and obj.device_name:
-        statement = select(Device).where(Device.name == obj.device_name)
-        device = session.exec(statement).first()
-
-    if device:
-        return get_effective_access_level(device, session)
-
-    # 4. Fallback to Global Default
-    return DEFAULT_ACCESS_LEVEL
-
-
-def _get_inherited_list_field(
-    obj: Collection | Dataset | Shot | Device,
-    field_name: str,
-    session: Session,
-) -> list[str] | None:
-    """
-    Walk Collection/Dataset → Shot → Device returning the first explicitly-set
-    list field (``required_scopes`` or ``allowed_idps``).
-
-    Returns ``None`` if the field is unset at every level of the hierarchy.
-    Collections follow the same resolution chain as Datasets.
-    """
-    val: list[str] | None = getattr(obj, field_name, None)
-    if val is not None:
-        return val
-
-    if isinstance(obj, (Dataset, Collection)):
-        # Try shot first (composite key: device_name + shot_id)
-        if obj.shot_id and obj.device_name:
-            shot = session.get(Shot, (obj.device_name, obj.shot_id))
-            if shot:
-                val = _get_inherited_list_field(shot, field_name, session)
-                if val is not None:
-                    return val
-        # Fallthrough to device
-        if obj.device_name:
-            stmt = select(Device).where(Device.name == obj.device_name)
-            device = session.exec(stmt).first()
-            if device:
-                return _get_inherited_list_field(device, field_name, session)
-
-    elif isinstance(obj, Shot) and obj.device_name:
-        stmt = select(Device).where(Device.name == obj.device_name)
-        device = session.exec(stmt).first()
+    device_name = getattr(obj, "device_name", None)
+    if device_name:
+        device = session.exec(select(Device).where(Device.name == device_name)).first()
         if device:
-            return _get_inherited_list_field(device, field_name, session)
+            chain.append(device)
 
+    return chain
+
+
+def _inherit(sources: Sequence[Any], field: str) -> Any:
+    """The first explicitly-set value of ``field`` along ``sources``.
+
+    ``None`` means "not set, keep looking"; every other value stops the walk,
+    including an empty ``required_scopes``, which is a policy in its own right
+    (any authenticated user from an allowed IdP) rather than an absence.
+    """
+    for source in sources:
+        value = getattr(source, field, None)
+        if value is not None:
+            return value
     return None
 
 
-def get_effective_policy(
-    obj: Collection | Dataset | Shot | Device, session: Session
-) -> EffectivePolicy:
-    """
-    Returns the fully-resolved EffectivePolicy for a dataset (or shot/device),
-    inheriting required_scopes and allowed_idps from the hierarchy.
-    """
-    return EffectivePolicy(
-        access_level=get_effective_access_level(obj, session),
-        required_scopes=_get_inherited_list_field(obj, "required_scopes", session),
-        allowed_idps=_get_inherited_list_field(obj, "allowed_idps", session),
+def _policy_from(sources: Sequence[Any]) -> EffectivePolicy:
+    """Resolve all three fields over one ordered list of policy sources."""
+    access_level, required_scopes, allowed_idps = (
+        _inherit(sources, field) for field in _POLICY_FIELDS
     )
+    return EffectivePolicy(
+        access_level=access_level or DEFAULT_ACCESS_LEVEL,
+        required_scopes=required_scopes,
+        allowed_idps=allowed_idps,
+    )
+
+
+def get_effective_policy(obj: Policied, session: Session) -> EffectivePolicy:
+    """The policy that applies to ``obj``, after inheritance.
+
+    Specific overrides general: the nearest explicitly-set value for each field
+    wins, and an unset ``access_level`` anywhere in the chain falls back to
+    ``DEFAULT_ACCESS_LEVEL``.
+    """
+    # A record that sets every policy field inherits nothing, so there is no
+    # chain worth loading.
+    if all(getattr(obj, field, None) is not None for field in _POLICY_FIELDS):
+        return _policy_from([obj])
+    return _policy_from(policy_chain(obj, session))
+
+
+def get_effective_access_level(obj: Policied, session: Session) -> AccessLevel:
+    """The effective access level for ``obj``, for callers wanting only that."""
+    return get_effective_policy(obj, session).access_level
+
+
+# A policy with nothing above it, so every unset field falls to the default.
+NO_PARENT = EffectivePolicy(
+    access_level=DEFAULT_ACCESS_LEVEL, required_scopes=None, allowed_idps=None
+)
+
+
+def read_denial(
+    kind: type[Policied],
+    policy: EffectivePolicy,
+    user: AuthenticatedUser,
+    device_name: str | None,
+    in_shot: bool,
+) -> str | None:
+    """Why ``user`` may not read a ``kind`` record's metadata, or ``None`` if they may.
+
+    Credentials for the record's data are decided separately, at vending.
+    """
+    if "fds-admin" in user.scopes:
+        return None
+    if policy.access_level in (AccessLevel.PUBLIC, AccessLevel.EMBARGOED):
+        return None
+    if user.is_anonymous:
+        return "Authentication required for this resource"
+    if policy.allowed_idps is not None and user.issuer not in policy.allowed_idps:
+        return (
+            "Access denied: your identity provider is not permitted for this resource"
+        )
+    if policy.required_scopes is not None:
+        for scope in policy.required_scopes:
+            if scope not in user.scopes:
+                return f"Not authorized, requires scope: {scope}"
+        return None
+    if kind in (Device, Shot):
+        return None
+    try:
+        if device_name is None:
+            check_is_admin(user)
+        elif kind is Dataset and in_shot:
+            check_shot_operator(user, device_name)
+        else:
+            check_device_admin(user, device_name)
+    except ForbiddenError as denied:
+        return str(denied)
+    return None
+
+
+def check_read(
+    obj: Policied,
+    session: Session,
+    user: AuthenticatedUser,
+    tier: ReadTier = ReadTier.READ,
+) -> None:
+    """Enforce read access to ``obj``, and record it when it is restricted."""
+    policy = get_effective_policy(obj, session)
+    denial = read_denial(
+        type(obj),
+        policy,
+        user,
+        getattr(obj, "device_name", None),
+        bool(getattr(obj, "shot_id", None)),
+    )
+    if denial:
+        raise ForbiddenError(denial)
+    record_restricted_read(obj, policy.access_level, tier)
+
+
+@dataclass
+class _Unresolved:
+    """A policy tuple read out of a row, before inheritance is applied."""
+
+    access_level: AccessLevel | None
+    required_scopes: list[str] | None
+    allowed_idps: list[str] | None
+
+
+def resolve_policy(
+    access_level: AccessLevel | None,
+    required_scopes: list[str] | None,
+    allowed_idps: list[str] | None,
+    parent_policy: EffectivePolicy,
+) -> EffectivePolicy:
+    """The policy for a row holding this tuple, inheriting from ``parent_policy``.
+
+    The same rule as ``get_effective_policy``, over a tuple rather than an
+    instance, so an aggregate can resolve a policy without loading the row it
+    belongs to. ``parent_policy`` is resolved once by the caller and reused
+    across every tuple, so this issues no queries.
+    """
+    row = _Unresolved(access_level, required_scopes, allowed_idps)
+    return _policy_from([row, parent_policy])
 
 
 def validate_policy_fields(

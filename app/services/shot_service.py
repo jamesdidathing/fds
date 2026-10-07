@@ -2,37 +2,45 @@ from collections.abc import Sequence
 from datetime import datetime
 from typing import Any
 
+from sqlalchemy import distinct, func, true, tuple_
 from sqlalchemy.exc import IntegrityError
 from sqlmodel import Session, col, select
 
 from app.auth.access_control import (
-    EffectivePolicy,
+    check_read,
     get_effective_access_level,
-    get_effective_policy,
     validate_policy_fields,
 )
 from app.auth.permissions import check_device_admin, check_shot_operator
-from app.core.audit import record_restricted_read
-from app.core.context import ReadTier, record_returned
+from app.core.context import ReadTier
 from app.core.naming import normalise_device_name
 from app.core.timeutils import as_utc
+from app.models.available_properties import (
+    AvailableProperties,
+    PropertyValue,
+    PropertyValues,
+)
 from app.models.device import Device
 from app.models.identity import ANONYMOUS_USER, AuthenticatedUser
-from app.models.policy import AccessLevel
 from app.models.shot import Shot, ShotCreate, ShotRead, ShotUpdate
 from app.services.annotation_service import AnnotationService
+from app.services.available_properties import DEFAULT_MAX_VALUES, available_properties
 from app.services.base_service import BaseService
 from app.services.dataset_service import DatasetService
 from app.services.exceptions import (
     ConflictError,
     DeviceNotFoundError,
     FDSValidationError,
-    ForbiddenError,
     ResourceNotFoundError,
 )
-from app.services.filters import annotation_clauses
+from app.services.filters import (
+    entries_of,
+    property_bound_clauses,
+    property_clauses,
+)
 from app.services.jsonld import map_shot_to_dcat
 from app.services.reference_service import REFERENCE_KINDS, ReferenceService
+from app.services.visibility import read_page, readable_clause, readable_only
 
 # Tolerance (seconds) when checking an explicit shot_duration against the
 # shot_at/shot_end interval, so a whole-second duration is not rejected against a
@@ -85,46 +93,7 @@ class ShotService(BaseService[Shot, ShotCreate, ShotUpdate]):
         tier: ReadTier = ReadTier.READ,
     ) -> None:
         """Enforce read access, and record it when the resource is not public."""
-        policy = get_effective_policy(shot, self.session)
-        self._enforce_read_policy(policy, user)
-        record_restricted_read(shot, policy.access_level, tier)
-
-    def _enforce_read_policy(
-        self, policy: EffectivePolicy, user: AuthenticatedUser
-    ) -> None:
-        """Enforce read access for Shot metadata.
-
-        Resolves the full effective policy (inherited ``access_level``,
-        ``required_scopes``, ``allowed_idps``) from the Shot → Device hierarchy.
-
-        - PUBLIC / EMBARGOED: metadata is discoverable by everyone (EMBARGOED
-          restricts data, not metadata — enforced at credential vending).
-        - RESTRICTED: requires an authenticated user, then any IdP and scope
-          gates set by the policy. With no explicit ``required_scopes`` an
-          authenticated user from a trusted IdP suffices (no capability check
-          for metadata reads — that belongs to credential vending).
-
-        Raises ``ForbiddenError`` when the user does not satisfy the policy.
-        """
-        if policy.access_level in (AccessLevel.PUBLIC, AccessLevel.EMBARGOED):
-            return
-
-        if user.is_anonymous:
-            raise ForbiddenError("Authentication required for this resource")
-
-        # Enforce IdP restriction if specified
-        if policy.allowed_idps is not None and user.issuer not in policy.allowed_idps:
-            raise ForbiddenError(
-                "Access denied: your identity provider is not permitted "
-                "for this resource"
-            )
-
-        # Enforce required scopes if explicitly set
-        # None → auth gate only (already passed); [] → same; [...] → all must be present
-        if policy.required_scopes is not None:
-            for scope in policy.required_scopes:
-                if scope not in user.scopes:
-                    raise ForbiddenError(f"Not authorized, requires scope: {scope}")
+        check_read(shot, self.session, user, tier)
 
     def create(
         self,
@@ -232,34 +201,161 @@ class ShotService(BaseService[Shot, ShotCreate, ShotUpdate]):
         user: AuthenticatedUser = ANONYMOUS_USER,
         offset: int = 0,
         limit: int = 100,
-        annotations: list[str] | None = None,
+        properties: list[str] | None = None,
+        minimums: list[str] | None = None,
+        maximums: list[str] | None = None,
+        id_prefix: str | None = None,
     ) -> Sequence[Shot]:
         """
         Retrieve all shots for a given device by its name.
 
-        ``annotations`` filters on feature annotations in ``scientific_metadata``;
+        ``properties`` filters on entries in ``scientific_metadata``;
         several must all be present (see ``app.services.filters``).
+        ``id_prefix`` keeps the shots whose ID starts with it.
         """
+        device = normalise_device_name(device_name) or ""
         statement = (
             select(Shot)
-            .where(Shot.device_name == normalise_device_name(device_name))
-            .where(*annotation_clauses(Shot.scientific_metadata, annotations))
-            .order_by(col(Shot.id))
-            .offset(offset)
-            .limit(limit)
+            .where(
+                *self._metadata_clauses(
+                    device, properties, minimums, maximums, id_prefix
+                )
+            )
+            .order_by(col(Shot.shot_at).desc().nullslast(), col(Shot.id).desc())
         )
-        result = self.session.exec(statement).all()
+        return read_page(
+            self.session, Shot, statement, user, offset=offset, limit=limit
+        )
 
-        accessible_shots = []
-        for s in result:
-            try:
-                self.check_read_access(s, user, ReadTier.LISTED)
-                accessible_shots.append(s)
-            except ForbiddenError:
-                continue
+    def _metadata_clauses(
+        self,
+        device: str,
+        properties: list[str] | None,
+        minimums: list[str] | None,
+        maximums: list[str] | None,
+        id_prefix: str | None = None,
+    ) -> list[Any]:
+        """The scope a filter describes, before access is applied.
 
-        record_returned(len(accessible_shots))
-        return accessible_shots
+        Shared by the listing and the properties so the two cannot drift: a count
+        that does not match the rows it counts is worse than no count.
+        """
+        clauses = [
+            Shot.device_name == device,
+            *property_clauses(Shot.scientific_metadata, properties),
+            *property_bound_clauses(Shot.scientific_metadata, minimums, lower=True),
+            *property_bound_clauses(Shot.scientific_metadata, maximums, lower=False),
+        ]
+        if id_prefix:
+            clauses.append(col(Shot.id).startswith(id_prefix, autoescape=True))
+        return clauses
+
+    def _readable_scope(
+        self,
+        device_name: str,
+        user: AuthenticatedUser,
+        properties: list[str] | None = None,
+        minimums: list[str] | None = None,
+        maximums: list[str] | None = None,
+        id_prefix: str | None = None,
+    ) -> list[Any]:
+        """The filtered scope, restricted to shots this caller may read."""
+        device = normalise_device_name(device_name) or ""
+        if not self.session.exec(select(Device).where(Device.name == device)).first():
+            raise DeviceNotFoundError(f"Device '{device_name}' not found")
+
+        where = self._metadata_clauses(
+            device, properties, minimums, maximums, id_prefix
+        )
+        scope = select(Shot).where(*where)
+        where.append(readable_clause(self.session, Shot, user, scope))
+        return where
+
+    def property_values(
+        self,
+        device_name: str,
+        name: str,
+        user: AuthenticatedUser = ANONYMOUS_USER,
+        query: str | None = None,
+        limit: int = 50,
+    ) -> PropertyValues:
+        """The values one name takes, with counts, for a vocabulary too big to list.
+
+        Searched here rather than in the client: a device's `objective` runs to
+        hundreds of values several hundred characters long, and shipping all of
+        them to filter in a browser wastes the bandwidth the cap exists to save.
+        """
+        if not 1 <= limit <= 500:
+            raise FDSValidationError(f"limit must be between 1 and 500, got {limit}.")
+
+        where = self._readable_scope(device_name, user)
+        entries = entries_of(col(Shot.scientific_metadata))
+        entry_name = entries.c.value.op("->>")("name")
+        entry_value = entries.c.value.op("->>")("value")
+        conditions = [*where, entry_name == name, entry_value.is_not(None)]
+        if query:
+            conditions.append(entry_value.ilike(f"%{query}%"))
+
+        rows = self.session.exec(
+            select(
+                entry_value.label("value"),
+                func.count(distinct(tuple_(col(Shot.device_name), col(Shot.id)))).label(
+                    "records"
+                ),
+            )
+            .select_from(Shot)
+            .join(entries, onclause=true())
+            .where(*conditions)
+            .group_by(entry_value)
+            .order_by(
+                func.count(
+                    distinct(tuple_(col(Shot.device_name), col(Shot.id)))
+                ).desc(),
+                entry_value,
+            )
+            .limit(limit)
+        ).all()
+
+        total_distinct = self.session.exec(
+            select(func.count(distinct(entry_value)))
+            .select_from(Shot)
+            .join(entries, onclause=true())
+            .where(*conditions)
+        ).one()
+
+        return PropertyValues(
+            name=name,
+            distinct=total_distinct,
+            values=[
+                PropertyValue(value=value, records=records) for value, records in rows
+            ],
+        )
+
+    def available_properties(
+        self,
+        device_name: str,
+        user: AuthenticatedUser = ANONYMOUS_USER,
+        properties: list[str] | None = None,
+        minimums: list[str] | None = None,
+        maximums: list[str] | None = None,
+        max_values: int = DEFAULT_MAX_VALUES,
+        id_prefix: str | None = None,
+    ) -> AvailableProperties:
+        """The properties a device's shots carry, for building a filter.
+
+        Scoped by the same ``properties`` filter as the listing, so ``total``
+        counts the matching shots this caller may read.
+        """
+        where = self._readable_scope(
+            device_name, user, properties, minimums, maximums, id_prefix
+        )
+        return available_properties(
+            self.session,
+            Shot,
+            col(Shot.scientific_metadata),
+            where=where,
+            max_values=max_values,
+        )
 
     def update(
         self,
@@ -343,12 +439,13 @@ class ShotService(BaseService[Shot, ShotCreate, ShotUpdate]):
         shot: Shot,
         include_device: bool = False,
         include_annotations: bool = False,
+        user: AuthenticatedUser = ANONYMOUS_USER,
     ) -> "ShotRead":
         """
         Converts a Shot ORM object to a ShotRead DTO, optionally including the full device object.
         Centralises the presentation logic for shots. When ``include_annotations``
-        is set, resolves the shot's shot-frame and device-frame annotations,
-        frame-scoped, so no dataset-frame annotations leak in.
+        is set, resolves the shot's shot-frame and device-frame properties,
+        frame-scoped, so no dataset-frame properties leak in.
         """
         read_model = ShotRead.model_validate(shot)
         read_model.effective_access_level = get_effective_access_level(
@@ -358,18 +455,27 @@ class ShotService(BaseService[Shot, ShotCreate, ShotUpdate]):
             read_model.device = None
         if include_annotations:
             dataset_service = DatasetService(self.session)
+            annotations = readable_only(
+                self.session, AnnotationService(self.session).for_shot(shot), user
+            )
             read_model.annotations = [
-                dataset_service.to_read_model(annotation)
-                for annotation in AnnotationService(self.session).for_shot(shot)
+                dataset_service.to_read_model(annotation) for annotation in annotations
             ] or None
         return read_model
 
     def to_dcat(
-        self, shot: Shot, base_url: str, *, include_annotations: bool = False
+        self,
+        shot: Shot,
+        base_url: str,
+        *,
+        include_annotations: bool = False,
+        user: AuthenticatedUser = ANONYMOUS_USER,
     ) -> dict[str, Any]:
         """Build the shot's DCAT/JSON-LD document, resolving its annotations into
         qualified relations."""
-        enriched = self.to_read_model(shot, include_annotations=include_annotations)
+        enriched = self.to_read_model(
+            shot, include_annotations=include_annotations, user=user
+        )
         return map_shot_to_dcat(
             shot,
             base_url,

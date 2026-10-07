@@ -1,9 +1,16 @@
-from datetime import datetime
+from datetime import date
 from typing import TYPE_CHECKING
 
 from sqlmodel import JSON, Column, Field, PrimaryKeyConstraint, Relationship, SQLModel
 
-from .mixins import ScientificMetadataMixin, TimestampMixin
+from app.core.timeutils import UTCDatetime
+
+from .mixins import (
+    IssuedMixin,
+    PersistentIdentifierMixin,
+    ScientificMetadataMixin,
+    TimestampMixin,
+)
 from .policy import AccessLevel
 from .scientific_metadata import ScientificProperty
 
@@ -13,10 +20,12 @@ if TYPE_CHECKING:
     from .device import Device, DeviceRead
 
 
-class ShotBase(ScientificMetadataMixin, TimestampMixin, SQLModel):
+class ShotBase(
+    ScientificMetadataMixin, PersistentIdentifierMixin, IssuedMixin, SQLModel
+):
     id: str = Field(index=True)
-    shot_at: datetime | None = Field(default=None, index=True)
-    shot_end: datetime | None = Field(default=None, index=True)
+    shot_at: UTCDatetime | None = Field(default=None, index=True)
+    shot_end: UTCDatetime | None = Field(default=None, index=True)
     shot_duration: float | None = Field(
         default=None,
         description=(
@@ -24,7 +33,7 @@ class ShotBase(ScientificMetadataMixin, TimestampMixin, SQLModel):
             "set, shot_duration must equal the interval between them."
         ),
     )
-    t0_at: datetime | None = Field(
+    t0_at: UTCDatetime | None = Field(
         default=None,
         description=(
             "Wall-clock instant of the shot's relative time base zero (t=0), e.g. "
@@ -53,7 +62,7 @@ class ShotBase(ScientificMetadataMixin, TimestampMixin, SQLModel):
     )
 
 
-class Shot(ShotBase, table=True):
+class Shot(ShotBase, TimestampMixin, table=True):
     __table_args__ = (PrimaryKeyConstraint("device_name", "id"),)
     id: str = Field(primary_key=True)
     device_name: str = Field(foreign_key="device.name", primary_key=True, index=True)
@@ -88,7 +97,7 @@ class ShotCreate(ShotBase):
     device_name: str | None = None
 
 
-class ShotRead(ShotBase):
+class ShotRead(ShotBase, TimestampMixin):
     effective_access_level: AccessLevel | None = None
     device_name: str | None = None
     device: "DeviceRead | None" = None
@@ -96,10 +105,12 @@ class ShotRead(ShotBase):
 
 
 class ShotUpdate(SQLModel):
-    shot_at: datetime | None = None
-    shot_end: datetime | None = None
+    persistent_identifier: str | None = None
+    issued: date | None = None
+    shot_at: UTCDatetime | None = None
+    shot_end: UTCDatetime | None = None
     shot_duration: float | None = None
-    t0_at: datetime | None = None
+    t0_at: UTCDatetime | None = None
     description: str | None = None
     publisher: str | None = None
     creator: str | None = None

@@ -2,7 +2,7 @@ from typing import TYPE_CHECKING
 
 from sqlmodel import JSON, Column, Field, Relationship, SQLModel
 
-from .mixins import DescriptiveMixin, TimestampMixin
+from .mixins import DescriptiveMixin, PersistentIdentifierMixin, TimestampMixin
 from .policy import AccessLevel
 
 if TYPE_CHECKING:
@@ -10,7 +10,7 @@ if TYPE_CHECKING:
     from .source import Source
 
 
-class DeviceBase(DescriptiveMixin, TimestampMixin, SQLModel):
+class DeviceBase(DescriptiveMixin, PersistentIdentifierMixin, SQLModel):
     name: str = Field(index=True, unique=True)
     type: str | None = Field(default=None, index=True)
     began_operations: str | None = None
@@ -36,7 +36,7 @@ class DeviceBase(DescriptiveMixin, TimestampMixin, SQLModel):
     )
 
 
-class Device(DeviceBase, table=True):
+class Device(DeviceBase, TimestampMixin, table=True):
     id: int | None = Field(default=None, primary_key=True, index=True)
     shots: list["Shot"] = Relationship(
         back_populates="device",
@@ -52,13 +52,14 @@ class DeviceCreate(DeviceBase):
     pass
 
 
-class DeviceRead(DeviceBase):
+class DeviceRead(DeviceBase, TimestampMixin):
     id: int
     effective_access_level: AccessLevel | None = None
 
 
 class DeviceUpdate(SQLModel):
     name: str | None = None
+    persistent_identifier: str | None = None
     type: str | None = None
     began_operations: str | None = None
     status: str | None = None
